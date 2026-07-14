@@ -1,0 +1,67 @@
+name: Development Project Monitor
+
+on:
+  schedule:
+    - cron: "30 7 * * *"
+      timezone: "America/Toronto"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without sending notifications"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-project-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Restore monitor state
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: dev-project-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            dev-project-monitor-state-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == 'true' && '1' || '0' }}
+        run: |
+          mkdir -p data
+          ARGS=""
+          if [ "$DRY_RUN" = "1" ]; then
+            ARGS="--dry-run"
+          fi
+          python -m dev_project_monitor.monitor --config config.yml $ARGS
