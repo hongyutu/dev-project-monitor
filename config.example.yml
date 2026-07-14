@@ -1,7 +1,7 @@
 state_db: data/dev_project_monitor.sqlite3
 notify_on_first_run: false
 request_timeout_seconds: 30
-user_agent: "KellerEnterpriseDevProjectMonitor/1.0 (+contact: replace-with-your-email)"
+user_agent: "KellerEnterpriseDevProjectMonitor/1.0 (+contact: hongyutu0@gmail.com)"
 
 toronto:
   enabled: true
@@ -38,7 +38,7 @@ news:
 
 notifications:
   slack:
-    enabled: false
+    enabled: true
     webhook_url_env: SLACK_WEBHOOK_URL
   smtp:
     enabled: false
