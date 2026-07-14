@@ -3,7 +3,7 @@ name: Development Project Monitor
 on:
   schedule:
     - cron: "30 7 * * *"
-      timezone: "America/Toronto"
+      
   workflow_dispatch:
     inputs:
       dry_run:
