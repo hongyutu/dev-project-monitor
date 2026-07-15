@@ -927,7 +927,6 @@ class NewsMonitor:
             "building_type": self._infer_building_type(clean),
             "development_timelines": self._extract_timelines(clean),
             "influencing_parties": self._extract_parties(clean),
-            "snippet": shorten(clean, 700),
         }
 
     def _extract_location(self, text: str) -> str:
@@ -1096,7 +1095,6 @@ class Notifier:
             f"Timelines: {', '.join(extracted.get('development_timelines') or []) or 'Not found'}",
             f"Influencing parties: {', '.join(extracted.get('influencing_parties') or []) or 'Not found'}",
             f"Evidence keywords: {', '.join(p.get('evidence_keywords') or [])}",
-            f"Snippet: {extracted.get('snippet') or p.get('summary') or 'Not found'}",
         ]
 
     def _send_slack(self, text_body: str) -> bool:
