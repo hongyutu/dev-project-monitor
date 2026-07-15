@@ -17,6 +17,19 @@ toronto:
     - "PL"
     - "RH"
 
+ottawa:
+  enabled: true
+  export_url: "https://devapps-restapi.ottawa.ca/devapps/ExportData"
+  detail_base_url: "https://devapps.ottawa.ca/en/applications"
+  max_records: 2000
+  lookback_days: 45
+  application_types:
+    - "Official Plan Amendment"
+    - "Plan of Subdivision"
+    - "Plan of Condominium"
+    - "Site Plan Control"
+    - "Zoning By-law Amendment"
+
 news:
   enabled: true
   max_posts_per_site: 50
