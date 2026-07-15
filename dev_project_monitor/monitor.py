@@ -575,11 +575,26 @@ class OttawaDevAppsMonitor:
         sample = text[:8192]
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
-        except Exception:
-            dialect = csv.excel
-        rows = list(csv.DictReader(io.StringIO(text), dialect=dialect))
-        if rows and len(rows[0].keys()) > 1:
-            return rows
+            rows = list(csv.DictReader(io.StringIO(text, newline=""), dialect=dialect))
+            if rows and len(rows[0].keys()) > 1:
+                return rows
+        except csv.Error:
+            pass
+
+        # Fallback: Ottawa's export can contain awkward embedded line breaks.
+        # Try common delimiters explicitly before giving up.
+        for delimiter in ("\t", ",", ";", "|"):
+            try:
+                reader = csv.DictReader(
+                    io.StringIO(text, newline=""),
+                    delimiter=delimiter,
+                    quoting=csv.QUOTE_MINIMAL,
+                )
+                rows = list(reader)
+                if rows and len(rows[0].keys()) > 1:
+                    return rows
+            except csv.Error:
+                continue
 
         # Fallback for whitespace-rendered exports. This is not the primary path,
         # but it prevents a hard failure if the endpoint changes its delimiters.
