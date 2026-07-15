@@ -417,11 +417,14 @@ class TorontoAICMonitor:
 
         address = normalize_key(pick("address")) or built_address
         file_number = normalize_key(pick("file_number")) or exact_field("APPLICATION#", "REFERENCE_FILE#")
-        detail_url = normalize_key(pick("detail_url"))
-        if detail_url and not detail_url.startswith("http"):
-            detail_url = urljoin("https://www.toronto.ca/", detail_url)
-        if not detail_url:
-            detail_url = self._construct_detail_url(record, address)
+        # Prefer the current public City of Toronto application-details URL.
+        # The older APPLICATION_URL / app.toronto.ca/AIC/index.do?folderRsn=...
+        # often redirects to secure.toronto.ca and returns 403 from GitHub Actions.
+        legacy_detail_url = normalize_key(pick("detail_url"))
+        if legacy_detail_url and not legacy_detail_url.startswith("http"):
+            legacy_detail_url = urljoin("https://www.toronto.ca/", legacy_detail_url)
+
+        detail_url = self._construct_detail_url(record, address) or legacy_detail_url
 
         item = {
             "file_number": file_number,
@@ -439,21 +442,66 @@ class TorontoAICMonitor:
         return item
 
     def _construct_detail_url(self, record: dict[str, Any], title: str) -> str | None:
+        """Build current public Toronto application-details URL.
+
+        Expected public format:
+        https://www.toronto.ca/city-government/planning-development/application-details/?id=<id>&pid=<pid>&title=<TITLE>
+        """
         keymap = {compact_key(k): k for k in record.keys()}
 
         def value_for(names: list[str]) -> str | None:
             for name in names:
                 c = compact_key(name)
-                if c in keymap and record.get(keymap[c]):
-                    return normalize_key(record[keymap[c]])
+                if c in keymap:
+                    original = keymap[c]
+                    # Avoid CKAN datastore row id. That is not the Toronto application id.
+                    if original == "_id":
+                        continue
+                    value = record.get(original)
+                    if value not in (None, ""):
+                        return normalize_key(value)
             return None
 
-        app_id = value_for(["id", "application id", "folder id"])
-        pid = value_for(["pid", "property id", "parcel id"])
-        if app_id and pid:
-            slug = re.sub(r"[^A-Za-z0-9]+", "-", title.upper()).strip("-") or "APPLICATION"
-            return f"https://www.toronto.ca/city-government/planning-development/application-details/?id={quote_plus(app_id)}&pid={quote_plus(pid)}&title={quote_plus(slug)}"
-        return None
+        app_id = value_for([
+            "APPLICATION_ID",
+            "APPLICATIONID",
+            "APP_ID",
+            "APPID",
+            "FOLDER_ID",
+            "FOLDERID",
+            "FOLDER_RSN",
+            "FOLDERRSN",
+            "ID",
+        ])
+
+        pid = value_for([
+            "PID",
+            "PROPERTY_ID",
+            "PROPERTYID",
+            "PROP_ID",
+            "PROPID",
+            "PARCEL_ID",
+            "PARCELID",
+        ])
+
+        title_value = (
+            value_for(["TITLE", "APPLICATION_TITLE", "ADDRESS", "LOCATION"])
+            or title
+            or "APPLICATION"
+        )
+
+        if not app_id or not pid:
+            return None
+
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", str(title_value).upper()).strip("-")
+        if not slug:
+            slug = "APPLICATION"
+
+        return (
+            "https://www.toronto.ca/city-government/planning-development/"
+            f"application-details/?id={quote_plus(app_id)}&pid={quote_plus(pid)}&title={quote_plus(slug)}"
+        )
+
 
     def enrich_application(self, item: dict[str, Any]) -> dict[str, Any]:
         detail_url = item.get("detail_url")
