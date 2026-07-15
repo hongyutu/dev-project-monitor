@@ -1,6 +1,6 @@
 state_db: data/dev_project_monitor.sqlite3
 notify_on_first_run: true
-request_timeout_seconds: 30
+request_timeout_seconds: 45
 user_agent: "KellerEnterpriseDevProjectMonitor/1.0 (+contact: hongyutu0@gmail.com)"
 
 toronto:
@@ -8,7 +8,7 @@ toronto:
   ckan_base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
   package_id: "development-applications"
   max_records: 500
-  lookback_days: 30
+  lookback_days: 45
   application_types:
     - "OZ"
     - "SA"
