@@ -9,7 +9,13 @@ toronto:
   package_id: "development-applications"
   max_records: 500
   lookback_days: 45
-  application_types: []   # Example: ["Site Plan Control", "OPA/Rezoning"]
+  application_types:
+    - "OZ"
+    - "SA"
+    - "CD"
+    - "SB"
+    - "PL"
+    - "RH"
 
 news:
   enabled: true
