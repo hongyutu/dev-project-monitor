@@ -8,7 +8,7 @@ toronto:
   ckan_base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
   package_id: "development-applications"
   max_records: 500
-  lookback_days: 7
+  lookback_days: 30
   application_types:
     - "OZ"
     - "SA"
@@ -22,7 +22,7 @@ ottawa:
   export_url: "https://devapps-restapi.ottawa.ca/devapps/ExportData"
   detail_base_url: "https://devapps.ottawa.ca/en/applications"
   max_records: 2000
-  lookback_days: 7
+  lookback_days: 30
   application_types:
     - "Official Plan Amendment"
     - "Plan of Subdivision"
