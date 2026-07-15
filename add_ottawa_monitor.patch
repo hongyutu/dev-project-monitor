@@ -1,0 +1,311 @@
+diff -ruN '--exclude=__pycache__' inspect_monitor/config.example.yml ottawa_patch_work/config.example.yml
+--- inspect_monitor/config.example.yml	2026-07-14 21:46:00.000000000 +0000
++++ ottawa_patch_work/config.example.yml	2026-07-15 05:42:54.482445147 +0000
+@@ -9,7 +9,20 @@
+   package_id: "development-applications"
+   max_records: 500
+   lookback_days: 45
+-  application_types: []   # Example: ["Site Plan Control", "OPA/Rezoning"]
++  application_types: []   # Example: ["OZ", "SA"]
++
++ottawa:
++  enabled: true
++  export_url: "https://devapps-restapi.ottawa.ca/devapps/ExportData"
++  detail_base_url: "https://devapps.ottawa.ca/en/applications"
++  max_records: 2000
++  lookback_days: 45
++  application_types:
++    - "Official Plan Amendment"
++    - "Plan of Subdivision"
++    - "Plan of Condominium"
++    - "Site Plan Control"
++    - "Zoning By-law Amendment"
+ 
+ news:
+   enabled: true
+diff -ruN '--exclude=__pycache__' inspect_monitor/dev_project_monitor/monitor.py ottawa_patch_work/dev_project_monitor/monitor.py
+--- inspect_monitor/dev_project_monitor/monitor.py	2026-07-14 21:47:26.000000000 +0000
++++ ottawa_patch_work/dev_project_monitor/monitor.py	2026-07-15 05:43:27.281720056 +0000
+@@ -46,6 +46,20 @@
+         "lookback_days": 45,
+         "application_types": [],
+     },
++    "ottawa": {
++        "enabled": True,
++        "export_url": "https://devapps-restapi.ottawa.ca/devapps/ExportData",
++        "detail_base_url": "https://devapps.ottawa.ca/en/applications",
++        "max_records": 2000,
++        "lookback_days": 45,
++        "application_types": [
++            "Official Plan Amendment",
++            "Plan of Subdivision",
++            "Plan of Condominium",
++            "Site Plan Control",
++            "Zoning By-law Amendment",
++        ],
++    },
+     "news": {
+         "enabled": True,
+         "max_posts_per_site": 50,
+@@ -252,6 +266,10 @@
+         cur = self.conn.execute("SELECT COUNT(*) FROM seen_items")
+         return int(cur.fetchone()[0]) == 0
+ 
++    def source_is_empty(self, source: str) -> bool:
++        cur = self.conn.execute("SELECT COUNT(*) FROM seen_items WHERE source = ?", (source,))
++        return int(cur.fetchone()[0]) == 0
++
+     def has_seen(self, source: str, item_key: str) -> bool:
+         cur = self.conn.execute(
+             "SELECT 1 FROM seen_items WHERE source = ? AND item_key = ?", (source, item_key)
+@@ -464,6 +482,140 @@
+         return shorten(match.group(2), 800) if match else ""
+ 
+ 
++
++class OttawaDevAppsMonitor:
++    """Monitor City of Ottawa DevApps export data.
++
++    The public DevApps interface is JavaScript-rendered, so this monitor uses the
++    linked REST export endpoint instead of trying to scrape the search page.
++    """
++
++    FIELD_ALIASES: dict[str, list[str]] = {
++        "application_number": ["Application Number", "Application #", "applicationNumber", "application_number"],
++        "application_date": ["Application Date", "Date Received", "dateReceived", "applicationDate"],
++        "application_type": ["Application Type", "Application", "applicationType"],
++        "address_number": ["Address Number", "Street Number", "addressNumber"],
++        "road_name": ["Road Name", "Street Name", "roadName"],
++        "road_type": ["Road Type", "Street Type", "roadType"],
++        "status": ["Application Status", "Status", "applicationStatus"],
++        "review_status": ["Object Status Type", "Review Status", "reviewStatus", "objectStatusType"],
++        "status_date": ["Object Status Date", "Status Date", "statusDate", "objectStatusDate"],
++        "file_lead": ["File Lead", "File Lead Name", "Planner", "fileLead"],
++        "description": ["Brief Description", "Description", "briefDescription"],
++        "ward_number": ["Ward #", "Ward Number", "wardNumber"],
++        "ward": ["Ward", "ward"],
++    }
++
++    def __init__(self, http: HttpClient, config: dict[str, Any]) -> None:
++        self.http = http
++        self.config = config
++        self.export_url = config.get("export_url", "https://devapps-restapi.ottawa.ca/devapps/ExportData")
++        self.detail_base_url = config.get("detail_base_url", "https://devapps.ottawa.ca/en/applications").rstrip("/")
++
++    def fetch_new_candidates(self) -> list[dict[str, Any]]:
++        records = self._fetch_export_records()
++        allowed_types = {compact_key(x) for x in self.config.get("application_types", []) if x}
++        lookback_days = int(self.config.get("lookback_days", 45))
++        cutoff = utcnow() - timedelta(days=lookback_days)
++        max_records = int(self.config.get("max_records", 2000))
++
++        grouped: dict[str, dict[str, Any]] = {}
++        for record in records[:max_records]:
++            item = self._normalize_record(record)
++            app_number = item.get("application_number")
++            if not app_number:
++                continue
++            if allowed_types and compact_key(item.get("application_type")) not in allowed_types:
++                continue
++            date_value = parse_dt(item.get("application_date") or item.get("status_date"))
++            if date_value and date_value < cutoff:
++                continue
++
++            existing = grouped.get(app_number)
++            if not existing:
++                item["addresses"] = [item["address"]] if item.get("address") else []
++                grouped[app_number] = item
++                continue
++
++            if item.get("address") and item["address"] not in existing.setdefault("addresses", []):
++                existing["addresses"].append(item["address"])
++            if not existing.get("description") and item.get("description"):
++                existing["description"] = item["description"]
++            if not existing.get("status") and item.get("status"):
++                existing["status"] = item["status"]
++            if not existing.get("review_status") and item.get("review_status"):
++                existing["review_status"] = item["review_status"]
++
++        out = list(grouped.values())
++        out.sort(key=lambda x: parse_dt(x.get("application_date") or x.get("status_date")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
++        return out
++
++    def _fetch_export_records(self) -> list[dict[str, Any]]:
++        response = self.http.get(self.export_url)
++        content_type = response.headers.get("content-type", "").lower()
++        text = response.text.lstrip("\ufeff")
++
++        if "json" in content_type or text[:1] in "[{":
++            data = response.json()
++            if isinstance(data, list):
++                return [x for x in data if isinstance(x, dict)]
++            if isinstance(data, dict):
++                for key in ("data", "records", "results", "items"):
++                    value = data.get(key)
++                    if isinstance(value, list):
++                        return [x for x in value if isinstance(x, dict)]
++            return []
++
++        sample = text[:8192]
++        try:
++            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
++        except Exception:
++            dialect = csv.excel
++        rows = list(csv.DictReader(io.StringIO(text), dialect=dialect))
++        if rows and len(rows[0].keys()) > 1:
++            return rows
++
++        # Fallback for whitespace-rendered exports. This is not the primary path,
++        # but it prevents a hard failure if the endpoint changes its delimiters.
++        return []
++
++    def _normalize_record(self, record: dict[str, Any]) -> dict[str, Any]:
++        keymap = {compact_key(k): k for k in record.keys()}
++
++        def pick(logical: str) -> Any:
++            for alias in self.FIELD_ALIASES[logical]:
++                c = compact_key(alias)
++                if c in keymap and record.get(keymap[c]) not in (None, ""):
++                    return record[keymap[c]]
++            for field_compact, original in keymap.items():
++                if any(compact_key(alias) in field_compact for alias in self.FIELD_ALIASES[logical]):
++                    if record.get(original) not in (None, ""):
++                        return record[original]
++            return None
++
++        number = normalize_key(pick("address_number"))
++        road_name = normalize_key(pick("road_name"))
++        road_type = normalize_key(pick("road_type"))
++        address = normalize_key(" ".join(x for x in [number, road_name, road_type] if x))
++        app_number = normalize_key(pick("application_number"))
++        detail_url = f"{self.detail_base_url}/{quote_plus(app_number)}/details" if app_number else None
++
++        return {
++            "application_number": app_number,
++            "application_date": normalize_key(pick("application_date")),
++            "application_type": normalize_key(pick("application_type")),
++            "address": address,
++            "status": normalize_key(pick("status")),
++            "review_status": normalize_key(pick("review_status")),
++            "status_date": normalize_key(pick("status_date")),
++            "file_lead": normalize_key(pick("file_lead")),
++            "description": shorten(normalize_key(pick("description")), 1200),
++            "ward_number": normalize_key(pick("ward_number")),
++            "ward": normalize_key(pick("ward")),
++            "detail_url": detail_url,
++            "raw": record,
++        }
++
+ class NewsMonitor:
+     def __init__(self, http: HttpClient, config: dict[str, Any]) -> None:
+         self.http = http
+@@ -687,6 +839,8 @@
+                 sections.append(f"URL: {item.url}")
+             if item.kind == "toronto_aic":
+                 sections.extend(self._render_toronto(p))
++            elif item.kind == "ottawa_devapps":
++                sections.extend(self._render_ottawa(p))
+             else:
+                 sections.extend(self._render_news(p))
+             sections.append("-" * 72)
+@@ -718,6 +872,20 @@
+                     lines.append(f"  - {label}: {match.get('label')} | {match.get('url')}")
+         return lines
+ 
++    def _render_ottawa(self, p: dict[str, Any]) -> list[str]:
++        addresses = ", ".join(p.get("addresses") or []) or p.get("address") or "Not found"
++        return [
++            f"Application number: {p.get('application_number') or 'Not found'}",
++            f"Address(es): {addresses}",
++            f"Application type: {p.get('application_type') or 'Not found'}",
++            f"Status/review: {p.get('status') or 'Not found'} / {p.get('review_status') or 'Not found'}",
++            f"Date received: {p.get('application_date') or 'Not found'}",
++            f"Status date: {p.get('status_date') or 'Not found'}",
++            f"Ward: {p.get('ward_number') or ''} {p.get('ward') or 'Not found'}".strip(),
++            f"File lead: {p.get('file_lead') or 'Not found'}",
++            f"Description: {p.get('description') or 'Not found'}",
++        ]
++
+     def _render_news(self, p: dict[str, Any]) -> list[str]:
+         extracted = p.get("extracted") or {}
+         return [
+@@ -802,6 +970,27 @@
+     return items
+ 
+ 
++
++def to_notification_items_from_ottawa(apps: Iterable[dict[str, Any]]) -> list[NotificationItem]:
++    items: list[NotificationItem] = []
++    for app in apps:
++        key = compact_key(app.get("application_number")) or stable_hash(
++            {"address": app.get("address"), "date": app.get("application_date")}
++        )
++        title = ", ".join(app.get("addresses") or []) or app.get("application_number") or "Ottawa development application"
++        items.append(
++            NotificationItem(
++                source="ottawa_devapps",
++                item_key=key,
++                title=title,
++                url=app.get("detail_url"),
++                kind="ottawa_devapps",
++                payload=app,
++            )
++        )
++    return items
++
++
+ def to_notification_items_from_news(posts: Iterable[dict[str, Any]]) -> list[NotificationItem]:
+     items: list[NotificationItem] = []
+     for post in posts:
+@@ -820,17 +1009,21 @@
+ 
+ 
+ def filter_unseen(store: StateStore, items: list[NotificationItem], notify_on_first_run: bool, mark: bool = True) -> list[NotificationItem]:
+-    first_run = store.is_empty()
++    source_first_run = {item.source: store.source_is_empty(item.source) for item in items}
++    bootstrapped_counts: dict[str, int] = {}
+     unseen: list[NotificationItem] = []
+     for item in items:
+         if store.has_seen(item.source, item.item_key):
+             continue
+         if mark:
+             store.mark_seen(item.source, item.item_key, stable_hash(item.payload))
+-        if not first_run or notify_on_first_run:
++        if not source_first_run.get(item.source, False) or notify_on_first_run:
+             unseen.append(item)
+-    if first_run and not notify_on_first_run:
+-        LOGGER.info("First run detected; bootstrapped %d item(s) without notification.", len(items))
++        else:
++            bootstrapped_counts[item.source] = bootstrapped_counts.get(item.source, 0) + 1
++    if bootstrapped_counts and not notify_on_first_run:
++        summary = ", ".join(f"{source}: {count}" for source, count in sorted(bootstrapped_counts.items()))
++        LOGGER.info("First run for source(s); bootstrapped item(s) without notification: %s", summary)
+     return unseen
+ 
+ 
+@@ -851,6 +1044,16 @@
+         except Exception as exc:
+             LOGGER.exception("Toronto AIC check failed: %s", exc)
+ 
++    if config.get("ottawa", {}).get("enabled", False):
++        LOGGER.info("Checking Ottawa DevApps development applications")
++        try:
++            ottawa_monitor = OttawaDevAppsMonitor(http, config["ottawa"])
++            apps = ottawa_monitor.fetch_new_candidates()
++            candidate_items.extend(to_notification_items_from_ottawa(apps))
++            LOGGER.info("Ottawa DevApps yielded %d candidate application(s)", len(apps))
++        except Exception as exc:
++            LOGGER.exception("Ottawa DevApps check failed: %s", exc)
++
+     if config.get("news", {}).get("enabled", True):
+         LOGGER.info("Checking industry news sources")
+         try:
+@@ -867,7 +1070,7 @@
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+-    parser = argparse.ArgumentParser(description="Monitor Toronto development applications and construction/development news.")
++    parser = argparse.ArgumentParser(description="Monitor Toronto/Ottawa development applications and construction/development news.")
+     parser.add_argument("--config", default="config.yml", help="Path to YAML config file")
+     parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them")
+     args = parser.parse_args(argv)
