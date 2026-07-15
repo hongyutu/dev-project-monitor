@@ -14,6 +14,14 @@ on:
         options:
           - "true"
           - "false"
+      reset_state:
+        description: "Reset seen database before this manual run"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -43,6 +51,12 @@ jobs:
           key: dev-project-monitor-state-${{ github.run_id }}
           restore-keys: |
             dev-project-monitor-state-
+
+      - name: Reset monitor state for manual initial run
+        if: github.event_name == 'workflow_dispatch' && inputs.reset_state == 'true'
+        run: |
+          rm -f data/dev_project_monitor.sqlite3
+          echo "Monitor state reset for this manual run."
 
       - name: Install dependencies
         run: pip install -r requirements.txt
