@@ -115,6 +115,12 @@ NEGATIVE_NEWS_KEYWORDS = {
 }
 
 DOCUMENT_PATTERNS: dict[str, list[str]] = {
+    "application_form": [
+        r"application\s+form",
+        r"development\s+application\s+form",
+        r"planning\s+application\s+form",
+        r"application\s+summary",
+    ],
     "civil_site_plan": [
         r"civil",
         r"site\s+plan",
@@ -703,6 +709,7 @@ class Notifier:
         ]
         docs = p.get("documents") or {}
         labels = {
+            "application_form": "Application form",
             "civil_site_plan": "Civil / site plan / servicing",
             "architectural": "Architectural plans",
             "structural": "Structural plans",
