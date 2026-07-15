@@ -1,6 +1,6 @@
 state_db: data/dev_project_monitor.sqlite3
 notify_on_first_run: true
-request_timeout_seconds: 45
+request_timeout_seconds: 30
 user_agent: "KellerEnterpriseDevProjectMonitor/1.0 (+contact: hongyutu0@gmail.com)"
 
 toronto:
@@ -22,7 +22,7 @@ ottawa:
   export_url: "https://devapps-restapi.ottawa.ca/devapps/ExportData"
   detail_base_url: "https://devapps.ottawa.ca/en/applications"
   max_records: 2000
-  lookback_days: 30
+  lookback_days: 45
   application_types:
     - "Official Plan Amendment"
     - "Plan of Subdivision"
