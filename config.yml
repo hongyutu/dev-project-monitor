@@ -1,5 +1,5 @@
 state_db: data/dev_project_monitor.sqlite3
-notify_on_first_run: false
+notify_on_first_run: true
 request_timeout_seconds: 30
 user_agent: "KellerEnterpriseDevProjectMonitor/1.0 (+contact: hongyutu0@gmail.com)"
 
@@ -8,7 +8,7 @@ toronto:
   ckan_base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
   package_id: "development-applications"
   max_records: 500
-  lookback_days: 45
+  lookback_days: 7
   application_types:
     - "OZ"
     - "SA"
@@ -22,7 +22,7 @@ ottawa:
   export_url: "https://devapps-restapi.ottawa.ca/devapps/ExportData"
   detail_base_url: "https://devapps.ottawa.ca/en/applications"
   max_records: 2000
-  lookback_days: 45
+  lookback_days: 7
   application_types:
     - "Official Plan Amendment"
     - "Plan of Subdivision"
@@ -33,7 +33,7 @@ ottawa:
 news:
   enabled: true
   max_posts_per_site: 50
-  lookback_days: 21
+  lookback_days: 7
   minimum_keyword_score: 2
   sites:
     - name: RENX
