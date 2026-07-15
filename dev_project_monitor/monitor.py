@@ -321,7 +321,8 @@ class TorontoAICMonitor:
             item = self._normalize_record(record)
             if not item.get("file_number") and not item.get("address"):
                 continue
-            if allowed_types and compact_key(item.get("application_type")) not in allowed_types:
+            actual_type = compact_key(item.get("application_type"))
+            if allowed_types and actual_type not in allowed_types:
                 continue
             date_value = parse_dt(item.get("submitted_date") or item.get("last_updated"))
             if date_value and date_value < cutoff:
@@ -399,8 +400,23 @@ class TorontoAICMonitor:
                         return record[original]
             return None
 
-        address = normalize_key(pick("address"))
-        file_number = normalize_key(pick("file_number"))
+        def exact_field(*names: str) -> str:
+            for name in names:
+                key = compact_key(name)
+                if key in keymap and record.get(keymap[key]) not in (None, ""):
+                    return normalize_key(record[keymap[key]])
+            return ""
+
+        street_parts = [
+            exact_field("STREET_NUM"),
+            exact_field("STREET_NAME"),
+            exact_field("STREET_TYPE"),
+            exact_field("STREET_DIRECTION"),
+        ]
+        built_address = normalize_key(" ".join(part for part in street_parts if part))
+
+        address = normalize_key(pick("address")) or built_address
+        file_number = normalize_key(pick("file_number")) or exact_field("APPLICATION#", "REFERENCE_FILE#")
         detail_url = normalize_key(pick("detail_url"))
         if detail_url and not detail_url.startswith("http"):
             detail_url = urljoin("https://www.toronto.ca/", detail_url)
@@ -531,7 +547,11 @@ class OttawaDevAppsMonitor:
             app_number = item.get("application_number")
             if not app_number:
                 continue
-            if allowed_types and compact_key(item.get("application_type")) not in allowed_types:
+            actual_type = compact_key(item.get("application_type"))
+            if allowed_types and not any(
+                allowed in actual_type or actual_type in allowed
+                for allowed in allowed_types
+            ):
                 continue
             date_value = parse_dt(item.get("application_date") or item.get("status_date"))
             if date_value and date_value < cutoff:
