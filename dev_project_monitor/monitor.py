@@ -349,7 +349,7 @@ class TorontoOpenDataMonitor:
             if not item.get("file_number") and not item.get("address"):
                 continue
             actual_type = compact_key(item.get("application_type"))
-            if allowed_types and actual_type not in allowed_types:
+            if allowed_types and not self._type_matches(actual_type, allowed_types):
                 continue
             date_value = parse_dt(item.get("submitted_date") or item.get("last_updated"))
             if date_value and date_value < cutoff:
@@ -438,6 +438,23 @@ class TorontoOpenDataMonitor:
             return (exact_daily_csv, download_url, known_daily_resource, avoid_datastore_dump)
 
         return sorted(candidates, key=score, reverse=True)[0]
+
+    def _type_matches(self, actual_type: str, allowed_types: set[str]) -> bool:
+        """Match Toronto application type codes and long descriptions.
+
+        Toronto Open Data can expose values such as ``OZ`` or longer labels that
+        contain the code/description. Treat configured codes as prefixes or
+        contained values instead of requiring exact string equality.
+        """
+        if not actual_type:
+            return False
+        return any(
+            actual_type == allowed
+            or actual_type.startswith(allowed)
+            or allowed in actual_type
+            or actual_type in allowed
+            for allowed in allowed_types
+        )
 
     def _fetch_datastore_records(self, resource_id: str, max_records: int) -> list[dict[str, Any]]:
         url = f"{self.ckan_base}/datastore_search"
@@ -987,12 +1004,23 @@ class Notifier:
         if not items:
             LOGGER.info("No new matching development items.")
             return
+        delivery_mode = str(self.config.get("notifications", {}).get("delivery_mode", "digest")).lower()
+        LOGGER.info("Preparing notification(s) for %d new item(s): %s", len(items), summarize_sources(items))
+        if delivery_mode == "individual":
+            for item in items:
+                self._send_items([item])
+            return
+        self._send_items(items)
+
+    def _send_items(self, items: list[NotificationItem]) -> bool:
         subject = f"Development project monitor: {len(items)} new item(s)"
+        if len(items) == 1:
+            subject = f"Development project monitor: {items[0].title}"
         text_body = self._render_text(items)
         json_body = [dataclasses.asdict(item) for item in items]
         if self.dry_run:
             print(text_body)
-            return
+            return True
         delivered = False
         if self._send_slack(text_body):
             delivered = True
@@ -1003,6 +1031,7 @@ class Notifier:
         if not delivered:
             LOGGER.warning("No notification channel was enabled or configured; printing notification to stdout.")
             print(text_body)
+        return delivered
 
     def _render_text(self, items: list[NotificationItem]) -> str:
         sections = ["Development Project Monitor", f"Generated: {utcnow().isoformat()}", ""]
@@ -1122,15 +1151,74 @@ class Notifier:
         return True
 
 
+def normalized_key_part(value: Any) -> str:
+    """Normalize a value for use inside a composite item key."""
+    return re.sub(r"\s+", " ", html.unescape(str(value or "")).strip()).lower()
+
+
+def first_raw_value(raw: dict[str, Any], *names: str) -> str:
+    """Return the first non-empty raw value, using compact field-name matching."""
+    if not raw:
+        return ""
+    keymap = {compact_key(k): k for k in raw.keys()}
+    for name in names:
+        original = keymap.get(compact_key(name))
+        if original and raw.get(original) not in (None, ""):
+            return normalize_key(raw.get(original))
+    return ""
+
+
+def toronto_notification_key(app: dict[str, Any]) -> str:
+    """Build a unique Toronto row key.
+
+    The previous key used only the file number. Toronto can return multiple
+    current rows with the same file/application number, especially when an
+    application spans several properties or when the file number was not parsed
+    cleanly. SQLite then saw the later rows as already seen and only one item was
+    notified. This key includes the public application URL and property/date/type
+    fields so every candidate row can be notified while still remaining stable
+    across runs.
+    """
+    raw = app.get("raw") if isinstance(app.get("raw"), dict) else {}
+    key_payload = {
+        "file_number": normalized_key_part(app.get("file_number")),
+        "application_url": normalized_key_part(app.get("detail_url") or app.get("raw_application_url")),
+        "application_id": normalized_key_part(
+            first_raw_value(raw, "APPLICATION_ID", "APPLICATIONID", "FOLDER_ID", "FOLDERID", "ID")
+        ),
+        "pid": normalized_key_part(first_raw_value(raw, "PID", "PROPERTY_ID", "PROPERTYID", "PARCEL_ID", "PARCELID")),
+        "address": normalized_key_part(app.get("address")),
+        "submitted_date": normalized_key_part(app.get("submitted_date")),
+        "last_updated": normalized_key_part(app.get("last_updated")),
+        "application_type": normalized_key_part(app.get("application_type")),
+        "status": normalized_key_part(app.get("status")),
+        "parent_folder_number": normalized_key_part(app.get("parent_folder_number")),
+    }
+
+    # If Toronto changes a column name or most parsed fields are empty, include a
+    # raw-row hash as a deterministic fallback to avoid accidental key collapse.
+    if not any(key_payload.values()):
+        key_payload["raw_hash"] = stable_hash(raw)
+
+    return "toronto:" + stable_hash(key_payload)[:40]
+
+
+def summarize_sources(items: Iterable[NotificationItem]) -> str:
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item.source] = counts.get(item.source, 0) + 1
+    return ", ".join(f"{source}={count}" for source, count in sorted(counts.items())) or "none"
+
+
 def to_notification_items_from_toronto(apps: Iterable[dict[str, Any]]) -> list[NotificationItem]:
     items: list[NotificationItem] = []
     for app in apps:
-        key = compact_key(app.get("file_number")) or stable_hash({"address": app.get("address"), "submitted": app.get("submitted_date")})
-        title = app.get("address") or app.get("file_number") or "Toronto development application"
+        title_parts = [app.get("address"), app.get("file_number")]
+        title = " - ".join(str(part) for part in title_parts if part) or "Toronto development application"
         items.append(
             NotificationItem(
                 source="toronto_open_data",
-                item_key=key,
+                item_key=toronto_notification_key(app),
                 title=title,
                 url=app.get("detail_url"),
                 kind="toronto_open_data",
@@ -1138,7 +1226,6 @@ def to_notification_items_from_toronto(apps: Iterable[dict[str, Any]]) -> list[N
             )
         )
     return items
-
 
 
 def to_notification_items_from_ottawa(apps: Iterable[dict[str, Any]]) -> list[NotificationItem]:
@@ -1234,7 +1321,9 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
         except Exception as exc:
             LOGGER.exception("News check failed: %s", exc)
 
+    LOGGER.info("All sources yielded %d candidate item(s): %s", len(candidate_items), summarize_sources(candidate_items))
     unseen = filter_unseen(store, candidate_items, bool(config.get("notify_on_first_run", False)), mark=not dry_run)
+    LOGGER.info("After state filtering, %d new item(s) remain for notification: %s", len(unseen), summarize_sources(unseen))
     Notifier(config, dry_run=dry_run).send(unseen)
     return 0
 
