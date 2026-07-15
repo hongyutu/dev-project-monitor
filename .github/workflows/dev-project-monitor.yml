@@ -46,7 +46,16 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+      - name: Test Slack webhook
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          test -n "$SLACK_WEBHOOK_URL" || (echo "Missing SLACK_WEBHOOK_URL secret" && exit 1)
+          curl -X POST \
+            -H 'Content-type: application/json' \
+            --data '{"text":"Development Project Monitor test message from GitHub Actions."}' \
+            "$SLACK_WEBHOOK_URL"
       - name: Run monitor
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
