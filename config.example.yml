@@ -7,12 +7,16 @@ toronto:
   enabled: true
   ckan_base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
   package_id: "development-applications"
+  fallback_csv_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/0aa7e480-9b48-4919-98e0-6af7615b7809/resource/77f8a66a-bd43-40e6-b6c9-12a2b03a5032/download/development-applications.csv"
   max_records: 500
   lookback_days: 45
   application_types: []   # Example: ["OZ", "SA"]
 
 ottawa:
-  enabled: true
+  # Disabled by default until a stable official machine-readable Ottawa feed is confirmed.
+  # The public DevApps pages are JavaScript-rendered, and the previously configured
+  # ExportData endpoint is not documented/verified as a stable public API.
+  enabled: false
   export_url: "https://devapps-restapi.ottawa.ca/devapps/ExportData"
   detail_base_url: "https://devapps.ottawa.ca/en/applications"
   max_records: 2000
