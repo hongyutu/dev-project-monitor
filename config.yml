@@ -7,7 +7,7 @@ toronto:
   enabled: true
   ckan_base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
   package_id: "development-applications"
-  max_records: 500
+  max_records: 1000
   lookback_days: 45
   application_types:
     - "OZ"
