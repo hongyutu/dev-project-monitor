@@ -23,7 +23,7 @@ import textwrap
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from typing import Any, Iterable
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 import feedparser
 import requests
@@ -42,12 +42,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "ckan_base_url": "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action",
         "package_id": "development-applications",
+        "fallback_csv_url": (
+            "https://ckan0.cf.opendata.inter.prod-toronto.ca/"
+            "dataset/0aa7e480-9b48-4919-98e0-6af7615b7809/"
+            "resource/77f8a66a-bd43-40e6-b6c9-12a2b03a5032/"
+            "download/development-applications.csv"
+        ),
         "max_records": 500,
         "lookback_days": 45,
         "application_types": [],
     },
     "ottawa": {
-        "enabled": True,
+        "enabled": False,
         "export_url": "https://devapps-restapi.ottawa.ca/devapps/ExportData",
         "detail_base_url": "https://devapps.ottawa.ca/en/applications",
         "max_records": 2000,
@@ -303,12 +309,33 @@ class NotificationItem:
     payload: dict[str, Any]
 
 
-class TorontoAICMonitor:
+class TorontoOpenDataMonitor:
+    """Monitor Toronto Development Applications through the current Open Data CKAN feed.
+
+    This deliberately does not scrape the retired AIC detail endpoint. The daily
+    Open Data CSV/API already contains the dates, status fields, addresses and
+    public application links needed for monitoring.
+    """
+
+    FALLBACK_CSV_URL = (
+        "https://ckan0.cf.opendata.inter.prod-toronto.ca/"
+        "dataset/0aa7e480-9b48-4919-98e0-6af7615b7809/"
+        "resource/77f8a66a-bd43-40e6-b6c9-12a2b03a5032/"
+        "download/development-applications.csv"
+    )
+    LEGACY_AIC_PATTERNS = (
+        "app.toronto.ca/AIC/",
+        "secure.toronto.ca/AIC/",
+        "app.toronto.ca/AIC/index.do",
+        "secure.toronto.ca/AIC/index.do",
+    )
+
     def __init__(self, http: HttpClient, config: dict[str, Any]) -> None:
         self.http = http
         self.config = config
         self.ckan_base = config["ckan_base_url"].rstrip("/")
         self.package_id = config.get("package_id", "development-applications")
+        self.fallback_csv_url = config.get("fallback_csv_url") or self.FALLBACK_CSV_URL
 
     def fetch_new_candidates(self) -> list[dict[str, Any]]:
         records = self._fetch_ckan_records()
@@ -328,30 +355,89 @@ class TorontoAICMonitor:
             if date_value and date_value < cutoff:
                 continue
             normalized.append(item)
+
+        normalized.sort(
+            key=lambda x: parse_dt(x.get("submitted_date") or x.get("last_updated"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
         return normalized
 
     def _fetch_ckan_records(self) -> list[dict[str, Any]]:
-        package = self.http.get(f"{self.ckan_base}/package_show", params={"id": self.package_id}).json()
-        if not package.get("success"):
-            raise RuntimeError(f"CKAN package_show failed for {self.package_id}: {package}")
-        resources = package.get("result", {}).get("resources", [])
-        max_records = int(self.config.get("max_records", 500))
+        """Fetch records from Toronto CKAN, preferring the daily CSV download.
 
-        datastore_resources = [r for r in resources if r.get("datastore_active")]
-        for resource in datastore_resources:
+        The CKAN package exposes a datastore preview/dump and a daily CSV file.
+        Prefer the explicit `Development Applications.csv` resource because it is
+        the current public download containing the date and APPLICATION_URL fields.
+        """
+        resources: list[dict[str, Any]] = []
+        max_records = int(self.config.get("max_records", 500))
+        try:
+            package = self.http.get(f"{self.ckan_base}/package_show", params={"id": self.package_id}).json()
+            if not package.get("success"):
+                raise RuntimeError(f"CKAN package_show failed for {self.package_id}: {package}")
+            resources = package.get("result", {}).get("resources", []) or []
+        except Exception as exc:
+            LOGGER.warning("Could not resolve Toronto CKAN package metadata; will try fallback CSV: %s", exc)
+
+        urls_to_try: list[tuple[str, str, str]] = []
+        chosen = self._choose_csv_resource(resources)
+        if chosen and chosen.get("url"):
+            urls_to_try.append((str(chosen["url"]), str(chosen.get("format", "csv")).lower(), str(chosen.get("name") or chosen.get("id") or "CSV resource")))
+
+        if self.fallback_csv_url and all(url != self.fallback_csv_url for url, _, _ in urls_to_try):
+            urls_to_try.append((self.fallback_csv_url, "csv", "fallback Development Applications.csv"))
+
+        # Other official downloadable files are safe fallbacks, but only after
+        # the explicit daily CSV has been tried.
+        for resource in resources:
+            fmt = str(resource.get("format", "")).lower()
+            url = str(resource.get("url") or "")
+            if not url or url in {item[0] for item in urls_to_try}:
+                continue
+            if fmt in {"csv", "json", "geojson"} or url.lower().endswith((".csv", ".json", ".geojson")):
+                urls_to_try.append((url, fmt or "csv", str(resource.get("name") or resource.get("id") or "resource")))
+
+        for url, fmt, label in urls_to_try:
+            try:
+                records = self._fetch_resource_url(url, fmt)
+                if records:
+                    LOGGER.info("Toronto Open Data loaded %d record(s) from %s", len(records), label)
+                    return records[:max_records]
+            except Exception as exc:
+                LOGGER.warning("Could not read Toronto Open Data resource %s: %s", url, exc)
+
+        # Last-resort CKAN datastore read. This is still official CKAN data, not
+        # the retired AIC site, but it is deliberately lower priority than the CSV.
+        for resource in [r for r in resources if r.get("datastore_active")]:
             try:
                 return self._fetch_datastore_records(resource["id"], max_records=max_records)
             except Exception as exc:
-                LOGGER.warning("Could not read datastore resource %s: %s", resource.get("id"), exc)
+                LOGGER.warning("Could not read Toronto CKAN datastore resource %s: %s", resource.get("id"), exc)
 
-        downloadable = [r for r in resources if str(r.get("format", "")).lower() in {"csv", "json", "geojson"} and r.get("url")]
-        for resource in downloadable:
-            try:
-                return self._fetch_resource_url(resource["url"], str(resource.get("format", "")).lower())[:max_records]
-            except Exception as exc:
-                LOGGER.warning("Could not read resource %s: %s", resource.get("url"), exc)
+        raise RuntimeError("No usable Toronto Open Data CSV/JSON/datastore resource found for development-applications")
 
-        raise RuntimeError("No usable CKAN datastore or CSV/JSON/GeoJSON resource found for development-applications")
+    def _choose_csv_resource(self, resources: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+        candidates = [
+            r
+            for r in resources
+            if str(r.get("format") or "").upper() == "CSV"
+            or str(r.get("url") or "").lower().endswith(".csv")
+        ]
+        if not candidates:
+            return None
+
+        def score(resource: dict[str, Any]) -> tuple[int, int, int, int]:
+            name = str(resource.get("name") or resource.get("title") or "").strip().lower()
+            url = str(resource.get("url") or "").lower()
+            resource_id = str(resource.get("id") or "")
+            exact_daily_csv = int(name == "development applications.csv")
+            download_url = int("/download/development-applications.csv" in url)
+            known_daily_resource = int(resource_id == "77f8a66a-bd43-40e6-b6c9-12a2b03a5032")
+            avoid_datastore_dump = int("/datastore/dump/" not in url)
+            return (exact_daily_csv, download_url, known_daily_resource, avoid_datastore_dump)
+
+        return sorted(candidates, key=score, reverse=True)[0]
 
     def _fetch_datastore_records(self, resource_id: str, max_records: int) -> list[dict[str, Any]]:
         url = f"{self.ckan_base}/datastore_search"
@@ -373,8 +459,9 @@ class TorontoAICMonitor:
 
     def _fetch_resource_url(self, url: str, fmt: str) -> list[dict[str, Any]]:
         response = self.http.get(url)
-        text = response.text
-        if fmt == "csv" or url.lower().endswith(".csv"):
+        text = response.text.lstrip("\ufeff")
+        lower_url = url.lower()
+        if fmt == "csv" or lower_url.endswith(".csv") or "text/csv" in response.headers.get("content-type", "").lower():
             return list(csv.DictReader(io.StringIO(text)))
         data = response.json()
         if isinstance(data, dict) and "features" in data:
@@ -417,14 +504,8 @@ class TorontoAICMonitor:
 
         address = normalize_key(pick("address")) or built_address
         file_number = normalize_key(pick("file_number")) or exact_field("APPLICATION#", "REFERENCE_FILE#")
-        # Prefer the current public City of Toronto application-details URL.
-        # The older APPLICATION_URL / app.toronto.ca/AIC/index.do?folderRsn=...
-        # often redirects to secure.toronto.ca and returns 403 from GitHub Actions.
-        legacy_detail_url = normalize_key(pick("detail_url"))
-        if legacy_detail_url and not legacy_detail_url.startswith("http"):
-            legacy_detail_url = urljoin("https://www.toronto.ca/", legacy_detail_url)
-
-        detail_url = self._construct_detail_url(record, address) or legacy_detail_url
+        raw_detail_url = normalize_key(pick("detail_url")) or exact_field("APPLICATION_URL")
+        detail_url = self._canonical_toronto_application_url(raw_detail_url) or self._construct_detail_url(record, address)
 
         item = {
             "file_number": file_number,
@@ -435,14 +516,52 @@ class TorontoAICMonitor:
             "submitted_date": normalize_key(pick("submitted_date")),
             "last_updated": normalize_key(pick("last_updated")),
             "detail_url": detail_url,
-            "ward": normalize_key(pick("ward")),
+            "raw_application_url": raw_detail_url,
+            "link_status": self._link_status(raw_detail_url, detail_url),
+            "ward": exact_field("WARD_NAME") or normalize_key(pick("ward")),
+            "ward_number": exact_field("WARD_NUMBER"),
             "district": normalize_key(pick("district")),
+            "community_meeting_date": exact_field("COMMUNITY_MEETING_DATE"),
+            "community_meeting_time": exact_field("COMMUNITY_MEETING_TIME"),
+            "community_meeting_location": exact_field("COMMUNITY_MEETING_LOCATION"),
+            "contact_name": exact_field("CONTACT_NAME"),
+            "contact_phone": exact_field("CONTACT_PHONE"),
+            "contact_email": exact_field("CONTACT_EMAIL"),
+            "parent_folder_number": exact_field("PARENT_FOLDER_NUMBER"),
             "raw": record,
         }
         return item
 
+    def _link_status(self, raw_url: str, detail_url: str | None) -> str:
+        if detail_url:
+            return "current"
+        if self._is_legacy_toronto_url(raw_url):
+            return "legacy_aic_suppressed"
+        if raw_url:
+            return "invalid_suppressed"
+        return "missing"
+
+    def _is_legacy_toronto_url(self, url: str) -> bool:
+        lowered = normalize_key(url).lower()
+        return any(pattern.lower() in lowered for pattern in self.LEGACY_AIC_PATTERNS)
+
+    def _canonical_toronto_application_url(self, url: str) -> str | None:
+        url = normalize_key(url)
+        if not url or self._is_legacy_toronto_url(url):
+            return None
+        if url.startswith("/"):
+            url = urljoin("https://www.toronto.ca/", url)
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return None
+        if "toronto.ca" in parsed.netloc.lower() and "/application-details/" in parsed.path:
+            params = parse_qs(parsed.query)
+            if not all(params.get(key, [""])[0] for key in ("id", "pid", "title")):
+                return None
+        return url
+
     def _construct_detail_url(self, record: dict[str, Any], title: str) -> str | None:
-        """Build current public Toronto application-details URL.
+        """Build the current public Toronto application-details URL when ids exist.
 
         Expected public format:
         https://www.toronto.ca/city-government/planning-development/application-details/?id=<id>&pid=<pid>&title=<TITLE>
@@ -502,62 +621,21 @@ class TorontoAICMonitor:
             f"application-details/?id={quote_plus(app_id)}&pid={quote_plus(pid)}&title={quote_plus(slug)}"
         )
 
-
     def enrich_application(self, item: dict[str, Any]) -> dict[str, Any]:
-        detail_url = item.get("detail_url")
-        docs = {category: [] for category in DOCUMENT_PATTERNS}
-        page_summary = ""
-        if detail_url:
-            try:
-                html_text = self.http.get(detail_url).text
-                docs = self._extract_supporting_documents(html_text, detail_url)
-                page_summary = self._extract_page_summary(html_text)
-            except Exception as exc:
-                LOGGER.warning("Could not fetch AIC detail page %s: %s", detail_url, exc)
-        if not item.get("description") and page_summary:
-            item["description"] = page_summary
-        item["documents"] = docs
+        """No-op enrichment for Toronto.
+
+        The previous implementation fetched AIC/detail pages to classify supporting
+        documents. That path is intentionally disabled because the current monitor
+        should rely on Toronto Open Data rows and their APPLICATION_URL values only.
+        """
         return item
-
-    def _extract_supporting_documents(self, html_text: str, base_url: str) -> dict[str, list[dict[str, str]]]:
-        soup = BeautifulSoup(html_text, "html.parser")
-        links: list[tuple[str, str]] = []
-        for a in soup.find_all("a", href=True):
-            href = urljoin(base_url, a.get("href", ""))
-            label = shorten(a.get_text(" ", strip=True) or href, 300)
-            links.append((label, href))
-
-        # Some AIC pages store URLs inside JSON payloads instead of normal anchors.
-        for match in re.finditer(r"https?:\\?/\\?/[^\"'<>\s]+", html_text):
-            raw = match.group(0).replace("\\/", "/")
-            label = raw.rsplit("/", 1)[-1]
-            links.append((label, raw))
-
-        docs: dict[str, list[dict[str, str]]] = {category: [] for category in DOCUMENT_PATTERNS}
-        seen: set[tuple[str, str]] = set()
-        for label, href in links:
-            haystack = f"{label} {href}".lower()
-            for category, patterns in DOCUMENT_PATTERNS.items():
-                if any(re.search(pattern, haystack, re.I) for pattern in patterns):
-                    key = (category, href)
-                    if key not in seen:
-                        seen.add(key)
-                        docs[category].append({"label": label, "url": href})
-        return docs
-
-    def _extract_page_summary(self, html_text: str) -> str:
-        soup = BeautifulSoup(html_text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-        match = re.search(r"(Proposal|Description|Application Description)\s*[:\-]?\s*(.{80,1200})", text, re.I)
-        return shorten(match.group(2), 800) if match else ""
-
 
 
 class OttawaDevAppsMonitor:
-    """Monitor City of Ottawa DevApps export data.
+    """Experimental monitor for City of Ottawa DevApps export data.
 
-    The public DevApps interface is JavaScript-rendered, so this monitor uses the
-    linked REST export endpoint instead of trying to scrape the search page.
+    The public DevApps interface is JavaScript-rendered. This class only works if
+    `export_url` points to a stable machine-readable JSON/CSV export.
     """
 
     FIELD_ALIASES: dict[str, list[str]] = {
@@ -629,6 +707,12 @@ class OttawaDevAppsMonitor:
         content_type = response.headers.get("content-type", "").lower()
         text = response.text.lstrip("\ufeff")
 
+        if "doesn't work properly without javascript enabled" in text.lower():
+            raise RuntimeError(
+                "Ottawa DevApps returned the JavaScript shell instead of data; "
+                "the public pages are not directly scrapeable with requests."
+            )
+
         if "json" in content_type or text[:1] in "[{":
             data = response.json()
             if isinstance(data, list):
@@ -664,9 +748,10 @@ class OttawaDevAppsMonitor:
             except csv.Error:
                 continue
 
-        # Fallback for whitespace-rendered exports. This is not the primary path,
-        # but it prevents a hard failure if the endpoint changes its delimiters.
-        return []
+        raise RuntimeError(
+            "Ottawa ExportData did not return JSON or delimited rows. The configured "
+            "endpoint may be unavailable or not a stable public API."
+        )
 
     def _normalize_record(self, record: dict[str, Any]) -> dict[str, Any]:
         keymap = {compact_key(k): k for k in record.keys()}
@@ -926,7 +1011,7 @@ class Notifier:
             sections.append(f"{idx}. [{item.kind}] {item.title}")
             if item.url:
                 sections.append(f"URL: {item.url}")
-            if item.kind == "toronto_aic":
+            if item.kind in {"toronto_open_data", "toronto_aic"}:
                 sections.extend(self._render_toronto(p))
             elif item.kind == "ottawa_devapps":
                 sections.extend(self._render_ottawa(p))
@@ -936,31 +1021,26 @@ class Notifier:
         return "\n".join(sections)
 
     def _render_toronto(self, p: dict[str, Any]) -> list[str]:
-        lines = [
+        meeting_bits = [
+            p.get("community_meeting_date") or "",
+            p.get("community_meeting_time") or "",
+            p.get("community_meeting_location") or "",
+        ]
+        meeting = " | ".join(bit for bit in meeting_bits if bit) or "Not found"
+        contact_bits = [p.get("contact_name") or "", p.get("contact_phone") or "", p.get("contact_email") or ""]
+        contact = " | ".join(bit for bit in contact_bits if bit) or "Not found"
+        ward = " ".join(bit for bit in [p.get("ward_number") or "", p.get("ward") or ""] if bit) or "Not found"
+        return [
             f"File number: {p.get('file_number') or 'Not found'}",
             f"Address: {p.get('address') or 'Not found'}",
             f"Type/status: {p.get('application_type') or 'Not found'} / {p.get('status') or 'Not found'}",
             f"Submitted: {p.get('submitted_date') or 'Not found'}",
+            f"Ward: {ward}",
+            f"Community meeting: {meeting}",
+            f"Contact: {contact}",
+            f"Link status: {p.get('link_status') or 'Not found'}",
             f"Description: {p.get('description') or 'Not found'}",
-            "Supporting documents:",
         ]
-        docs = p.get("documents") or {}
-        labels = {
-            "application_form": "Application form",
-            "civil_site_plan": "Civil / site plan / servicing",
-            "architectural": "Architectural plans",
-            "structural": "Structural plans",
-            "geotechnical": "Geotechnical report",
-            "hydrogeological": "Hydrogeological report",
-        }
-        for key, label in labels.items():
-            matches = docs.get(key) or []
-            if not matches:
-                lines.append(f"  - {label}: not found on detail page")
-            else:
-                for match in matches[:5]:
-                    lines.append(f"  - {label}: {match.get('label')} | {match.get('url')}")
-        return lines
 
     def _render_ottawa(self, p: dict[str, Any]) -> list[str]:
         addresses = ", ".join(p.get("addresses") or []) or p.get("address") or "Not found"
@@ -1049,11 +1129,11 @@ def to_notification_items_from_toronto(apps: Iterable[dict[str, Any]]) -> list[N
         title = app.get("address") or app.get("file_number") or "Toronto development application"
         items.append(
             NotificationItem(
-                source="toronto_aic",
+                source="toronto_open_data",
                 item_key=key,
                 title=title,
                 url=app.get("detail_url"),
-                kind="toronto_aic",
+                kind="toronto_open_data",
                 payload=app,
             )
         )
@@ -1124,15 +1204,15 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
     candidate_items: list[NotificationItem] = []
 
     if config.get("toronto", {}).get("enabled", True):
-        LOGGER.info("Checking Toronto AIC development applications")
+        LOGGER.info("Checking Toronto Open Data development applications")
         try:
-            toronto_monitor = TorontoAICMonitor(http, config["toronto"])
+            toronto_monitor = TorontoOpenDataMonitor(http, config["toronto"])
             apps = toronto_monitor.fetch_new_candidates()
             enriched_apps = [toronto_monitor.enrich_application(app) for app in apps]
             candidate_items.extend(to_notification_items_from_toronto(enriched_apps))
-            LOGGER.info("Toronto AIC yielded %d candidate application(s)", len(enriched_apps))
+            LOGGER.info("Toronto Open Data yielded %d candidate application(s)", len(enriched_apps))
         except Exception as exc:
-            LOGGER.exception("Toronto AIC check failed: %s", exc)
+            LOGGER.exception("Toronto Open Data check failed: %s", exc)
 
     if config.get("ottawa", {}).get("enabled", False):
         LOGGER.info("Checking Ottawa DevApps development applications")
