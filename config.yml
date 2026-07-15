@@ -60,6 +60,7 @@ news:
       feed_urls: ["https://peoplenx.ca/feed/"]
 
 notifications:
+  delivery_mode: "individual"   # "digest" sends one grouped alert; "individual" sends one alert per item.
   slack:
     enabled: true
     webhook_url_env: SLACK_WEBHOOK_URL
