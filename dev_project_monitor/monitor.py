@@ -565,6 +565,15 @@ class TorontoOpenDataMonitor:
         address = normalize_key(pick("address")) or built_address
         file_number = normalize_key(pick("file_number")) or exact_field("APPLICATION#", "REFERENCE_FILE#")
         raw_detail_url = normalize_key(pick("detail_url")) or exact_field("APPLICATION_URL")
+        if not raw_detail_url:
+            app_id = exact_field("id", "ID", "APPLICATION_ID", "APP_ID", "APPLICATIONID")
+            pid = exact_field("pid", "PID", "PROPERTY_ID", "PROPERTYID", "PARCEL_ID")
+            title = exact_field("title", "TITLE", "APPLICATION_TITLE") or address
+            if app_id and pid and title:
+                raw_detail_url = (
+                    "https://www.toronto.ca/city-government/planning-development/application-details/?"
+                    + urlencode({"id": app_id, "pid": pid, "title": title})
+                )
         detail_url = self._application_details_url(raw_detail_url)
 
         return {
@@ -863,10 +872,15 @@ class TorontoOpenDataMonitor:
 
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
+                    browser_user_agent = self.config.get("browser_user_agent") or (
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    )
                     context = browser.new_context(
                         viewport={"width": 1365, "height": 2400},
-                        user_agent=self.http.session.headers.get("User-Agent"),
+                        user_agent=browser_user_agent,
                         accept_downloads=True,
+                        locale="en-CA",
                     )
                     try:
                         page = context.new_page()
@@ -887,6 +901,28 @@ class TorontoOpenDataMonitor:
                             pass
 
                         page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
+
+                        # Legacy folderRsn links often client-redirect to the current id/pid/title URL.
+                        # Reload that canonical URL once so the Angular app initializes from the
+                        # same URL shape a human browser uses when opening the page directly.
+                        try:
+                            normalized_start = self._application_details_url(url) or html.unescape(normalize_key(url))
+                            normalized_current = self._application_details_url(page.url) or html.unescape(normalize_key(page.url))
+                            if (
+                                normalized_current
+                                and normalized_current != normalized_start
+                                and "id=" in normalized_current
+                                and "pid=" in normalized_current
+                            ):
+                                LOGGER.info("Toronto render canonical reload: %s -> %s", normalized_start, normalized_current)
+                                page.goto(normalized_current, wait_until="domcontentloaded", timeout=int(self.config.get("page_timeout_ms", 60000)))
+                                try:
+                                    page.wait_for_load_state("networkidle", timeout=8000)
+                                except Exception:
+                                    pass
+                                page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
+                        except Exception as exc:
+                            LOGGER.info("Toronto canonical reload skipped for %s: %s", url, exc)
 
                         # A valid Toronto application page usually shows these labels, but do not
                         # fail here: the app can render the document table before all labels settle.
@@ -1054,6 +1090,10 @@ class TorontoOpenDataMonitor:
         if count_rows() > 0:
             return
 
+        self._click_supporting_docs_with_playwright_locators(page)
+        if count_rows() > 0:
+            return
+
         click_js = r"""
         (mode) => {
             const visible = (el) => {
@@ -1109,6 +1149,7 @@ class TorontoOpenDataMonitor:
 
         # Final attempt for accordion variants whose clickable control is a wrapper
         # rather than the visible text node.
+        self._click_supporting_docs_with_playwright_locators(page)
         self._force_supporting_docs_visible(page)
 
         # Final short wait for late-rendered Angular/DataTables content.
@@ -1117,16 +1158,99 @@ class TorontoOpenDataMonitor:
         except Exception:
             pass
 
-    def _force_supporting_docs_visible(self, page: Any) -> None:
-        """Aggressively open the Supporting Documentation UI without relying on one selector.
+    def _click_supporting_docs_with_playwright_locators(self, page: Any) -> int:
+        """Click Supporting Documentation controls using Playwright locators.
 
-        Toronto has changed this accordion several times. The document rows are
-        still regular table rows once the section is open, so this method clicks
-        likely controls and also removes common hidden/collapsed states.
+        Playwright CSS/text locators pierce open shadow DOM. The previous JS-only
+        approach used document.querySelectorAll(), which misses rows and controls
+        inside shadow roots. This method is intentionally broad but bounded.
         """
+        clicked_total = 0
+        selector_groups = [
+            "button:has-text('Expand All')",
+            "a:has-text('Expand All')",
+            "[role='button']:has-text('Expand All')",
+            "text=/^\\s*Expand\\s+All\\s*$/i",
+            "button:has-text('Supporting Documentation')",
+            "a:has-text('Supporting Documentation')",
+            "[role='button']:has-text('Supporting Documentation')",
+            "summary:has-text('Supporting Documentation')",
+            "[aria-label*='Supporting Documentation' i]",
+            "text=/Supporting\\s+Documentation/i",
+        ]
+        for scope in self._document_scopes(page):
+            for selector in selector_groups:
+                try:
+                    locator = scope.locator(selector)
+                    count = min(locator.count(), 8)
+                except Exception:
+                    continue
+                for index in range(count):
+                    try:
+                        target = locator.nth(index)
+                        target.scroll_into_view_if_needed(timeout=1500)
+                    except Exception:
+                        pass
+                    try:
+                        target.click(timeout=1800, force=True, no_wait_after=True)
+                        clicked_total += 1
+                        try:
+                            page.wait_for_timeout(350)
+                        except Exception:
+                            pass
+                        if sum(self._document_row_count(sc) for sc in self._document_scopes(page)) > 0:
+                            LOGGER.info(
+                                "Toronto Supporting Documentation Playwright locator click succeeded: selector=%s index=%s",
+                                selector,
+                                index,
+                            )
+                            return clicked_total
+                    except Exception:
+                        continue
+        if clicked_total:
+            LOGGER.info("Toronto Supporting Documentation Playwright locator clicks attempted: %s", clicked_total)
+        return clicked_total
+
+    def _force_supporting_docs_visible(self, page: Any) -> None:
+        """Aggressively open the Supporting Documentation UI.
+
+        Uses both Playwright locators and a JS deep traversal that walks open
+        shadow roots. This matters because the City page can render the AIC app
+        under component roots where plain document.querySelectorAll() sees only
+        the outer shell.
+        """
+        self._click_supporting_docs_with_playwright_locators(page)
         js = r"""
         () => {
             const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const roots = () => {
+                const out = [];
+                const seen = new Set();
+                const addRoot = root => {
+                    if (!root || seen.has(root)) return;
+                    seen.add(root);
+                    out.push(root);
+                    let nodes = [];
+                    try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                    for (const node of nodes) {
+                        if (node.shadowRoot) addRoot(node.shadowRoot);
+                    }
+                };
+                addRoot(document);
+                return out;
+            };
+            const allDeep = selector => {
+                const out = [];
+                const seen = new Set();
+                for (const root of roots()) {
+                    let nodes = [];
+                    try { nodes = Array.from(root.querySelectorAll(selector)); } catch (e) { nodes = []; }
+                    for (const node of nodes) {
+                        if (!seen.has(node)) { seen.add(node); out.push(node); }
+                    }
+                }
+                return out;
+            };
             const visible = el => {
                 try {
                     const style = window.getComputedStyle(el);
@@ -1134,45 +1258,61 @@ class TorontoOpenDataMonitor:
                     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
                 } catch (e) { return false; }
             };
-            const hasRows = () => Array.from(document.querySelectorAll('tr'))
-                .some(tr => /Application Form|Architectural|Civil|Geotechnical|Hydrogeological/i.test(tr.innerText || tr.textContent || '')
-                    && tr.querySelector('.downloadFile[data-id], button[data-id], a, button'));
-
-            let clicked = 0;
-            const clickCandidate = el => {
-                if (!el || clicked >= 8) return;
-                try {
-                    const target = el.closest('button,a,[role="button"],[aria-controls],summary,.accordion-button,.accordion-header,.panel-heading,.card-header,.btn') || el;
-                    target.scrollIntoView({block: 'center', inline: 'center'});
-                    target.click();
-                    clicked++;
-                } catch (e) {}
+            const rowReady = () => allDeep('tr, [role="row"]').some(tr => {
+                const text = clean(tr.innerText || tr.textContent || '');
+                return /Application Form|Architectural|Civil|Geotechnical|Hydrogeological/i.test(text)
+                    && (tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id], button, a')
+                        || allDeep('button.downloadFile[data-id], .downloadFile[data-id]').some(btn => tr.contains(btn)));
+            });
+            const dispatchClick = el => {
+                if (!el) return false;
+                try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+                for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    try { el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window})); } catch (e) {}
+                }
+                try { el.click(); } catch (e) {}
+                return true;
             };
 
-            const all = Array.from(document.querySelectorAll('body *'));
-            for (const el of all) {
-                const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
-                if (!text) continue;
-                if (/^Expand All$/i.test(text) || /^Supporting Documentation$/i.test(text) || /Supporting Documentation/i.test(text)) {
-                    if (visible(el)) clickCandidate(el);
-                    if (hasRows()) break;
+            let clicked = 0;
+            const controls = allDeep('button, a, [role="button"], summary, h1, h2, h3, h4, h5, .accordion-header, .accordion-button, [aria-controls], [data-toggle], [data-bs-toggle]');
+            for (const el of controls) {
+                if (clicked >= 20 || rowReady()) break;
+                const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+                if (!/Expand All|Supporting Documentation/i.test(text)) continue;
+                let target = el;
+                for (let depth = 0, cur = el; cur && depth < 5; depth++, cur = cur.parentElement) {
+                    const role = (cur.getAttribute && (cur.getAttribute('role') || '')).toLowerCase();
+                    const aria = (cur.getAttribute && (cur.getAttribute('aria-controls') || cur.getAttribute('data-target') || cur.getAttribute('data-bs-target') || '')).toLowerCase();
+                    const cls = String(cur.className || '').toLowerCase();
+                    if (cur.tagName && /^(BUTTON|A|SUMMARY)$/i.test(cur.tagName)) { target = cur; break; }
+                    if (role === 'button' || aria || /accordion|collapse|header|toggle|btn/.test(cls)) { target = cur; break; }
+                }
+                if (visible(target) || visible(el)) {
+                    if (dispatchClick(target)) { clicked++; }
                 }
             }
 
-            for (const el of document.querySelectorAll('[hidden]')) {
-                if (/Supporting Documentation|Reference File|Application Form|Download/i.test(el.innerText || el.textContent || '')) {
+            for (const el of allDeep('[hidden]')) {
+                const text = clean(el.innerText || el.textContent || '');
+                if (/Supporting Documentation|Reference File|Application Form|Download/i.test(text)) {
                     try { el.hidden = false; el.removeAttribute('hidden'); } catch (e) {}
                 }
             }
-            for (const el of document.querySelectorAll('.collapse, .collapsed, [aria-expanded="false"]')) {
-                const text = el.innerText || el.textContent || '';
+            for (const el of allDeep('.collapse, .collapsed, [aria-expanded="false"], [style*="display: none"], [style*="visibility: hidden"]')) {
+                const text = clean(el.innerText || el.textContent || '');
                 if (/Supporting Documentation|Reference File|Application Form|Download/i.test(text)) {
                     try { el.classList.add('show'); el.classList.remove('collapsed'); } catch (e) {}
                     try { el.setAttribute('aria-expanded', 'true'); } catch (e) {}
-                    try { el.style.display = 'block'; el.style.height = 'auto'; el.style.visibility = 'visible'; } catch (e) {}
+                    try { el.style.display = 'block'; el.style.height = 'auto'; el.style.visibility = 'visible'; el.style.opacity = '1'; } catch (e) {}
                 }
             }
-            return {clicked, hasRows: hasRows()};
+            return {
+                clicked,
+                hasRows: rowReady(),
+                downloadButtons: allDeep('button.downloadFile[data-id], .downloadFile[data-id]').length,
+                supportingTextMatches: allDeep('body *').filter(el => /Supporting Documentation/i.test(clean(el.innerText || el.textContent || ''))).length
+            };
         }
         """
         for scope in self._document_scopes(page):
@@ -1223,12 +1363,32 @@ class TorontoOpenDataMonitor:
                 for scope in self._document_scopes(page):
                     found = scope.evaluate(
                         r"""
-                        () => Array.from(document.querySelectorAll('tr')).some(tr => {
-                            const cells = Array.from(tr.children).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
-                            return cells.length >= 4
-                                && /Application\s+Form/i.test(cells[0].innerText || cells[0].textContent || '')
-                                && tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]');
-                        })
+                        () => {
+                            const roots = [];
+                            const seenRoots = new Set();
+                            const addRoot = root => {
+                                if (!root || seenRoots.has(root)) return;
+                                seenRoots.add(root);
+                                roots.push(root);
+                                let nodes = [];
+                                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+                            };
+                            addRoot(document);
+                            for (const root of roots) {
+                                let rows = [];
+                                try { rows = Array.from(root.querySelectorAll('tr, [role="row"]')); } catch (e) { rows = []; }
+                                for (const tr of rows) {
+                                    const cells = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
+                                    if (cells.length >= 4
+                                        && /Application\s+Form/i.test(cells[0].innerText || cells[0].textContent || '')
+                                        && tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]')) {
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        }
                         """
                     )
                     if found:
@@ -1245,6 +1405,7 @@ class TorontoOpenDataMonitor:
             if time.monotonic() >= deadline:
                 break
 
+            self._click_supporting_docs_with_playwright_locators(page)
             self._force_supporting_docs_visible(page)
             try:
                 page.wait_for_timeout(1500)
@@ -1263,10 +1424,28 @@ class TorontoOpenDataMonitor:
         try:
             return int(
                 scope.evaluate(
-                    """
-                    () => Array.from(document.querySelectorAll('table tbody tr, [role="row"]'))
-                        .filter(tr => /Download|Reference File|Application Form|Architectural|Civil|Geotechnical|Hydro/i.test(tr.innerText || ''))
-                        .length
+                    r"""
+                    () => {
+                        const roots = [];
+                        const seenRoots = new Set();
+                        const addRoot = root => {
+                            if (!root || seenRoots.has(root)) return;
+                            seenRoots.add(root);
+                            roots.push(root);
+                            let nodes = [];
+                            try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                            for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+                        };
+                        addRoot(document);
+                        const rows = [];
+                        const seen = new Set();
+                        for (const root of roots) {
+                            let found = [];
+                            try { found = Array.from(root.querySelectorAll('table tbody tr, table tr, tr, [role="row"]')); } catch (e) { found = []; }
+                            for (const row of found) if (!seen.has(row)) { seen.add(row); rows.push(row); }
+                        }
+                        return rows.filter(tr => /Download|Reference File|Application Form|Architectural|Civil|Geotechnical|Hydro/i.test(tr.innerText || tr.textContent || '')).length;
+                    }
                     """
                 )
             )
@@ -1376,6 +1555,90 @@ class TorontoOpenDataMonitor:
             fragment_parts.append("data-id=" + quote_plus(normalize_key(data_id)))
         return base + "#" + "&".join(fragment_parts)
 
+    def _extract_download_button_document_rows_with_locators(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str], int, int]:
+        """Use Playwright locators to read document rows.
+
+        Unlike page.evaluate(document.querySelectorAll(...)), Playwright's CSS
+        locators pierce open shadow DOM. This directly matches the observed City
+        row shape: td[0] is the Reference File and button.downloadFile[data-id]
+        is in the Action cell.
+        """
+        links: dict[str, str] = {}
+        available: set[str] = set()
+        rows_seen = 0
+        token_rows = 0
+        selectors = "table tbody tr, table tr, tr, [role='row']"
+
+        for scope in self._document_scopes(page):
+            try:
+                locator = scope.locator(selectors)
+                count = min(locator.count(), 2500)
+            except Exception:
+                continue
+            for index in range(count):
+                row = locator.nth(index)
+                rows_seen += 1
+                try:
+                    text = normalize_key(row.inner_text(timeout=500))
+                except Exception:
+                    try:
+                        text = normalize_key(row.text_content(timeout=500))
+                    except Exception:
+                        text = ""
+                if not text or "no matching records" in text.lower():
+                    continue
+
+                first_cell = ""
+                try:
+                    cells = row.locator("td, [role='cell']")
+                    if cells.count() > 0:
+                        first_cell = normalize_key(cells.nth(0).inner_text(timeout=500))
+                except Exception:
+                    first_cell = ""
+
+                document_name = self._document_name_for_text(first_cell) or self._document_name_for_text(text)
+                if not document_name:
+                    continue
+                available.add(document_name)
+
+                data_id = ""
+                href = ""
+                try:
+                    control = row.locator("button.downloadFile[data-id], .downloadFile[data-id]").first
+                    if control.count() > 0:
+                        data_id = normalize_key(control.get_attribute("data-id", timeout=500))
+                        href = normalize_key(control.get_attribute("href", timeout=500))
+                except Exception:
+                    pass
+                if not data_id:
+                    try:
+                        control = row.locator("button[data-id], [data-id], a[href], button:has-text('Download'), a:has-text('Download')").first
+                        if control.count() > 0:
+                            data_id = normalize_key(control.get_attribute("data-id", timeout=500))
+                            href = href or normalize_key(control.get_attribute("href", timeout=500))
+                    except Exception:
+                        pass
+
+                if href:
+                    full_url = urljoin(base_url, href)
+                    if self._is_meaningful_document_url(full_url, base_url):
+                        links.setdefault(document_name, full_url)
+
+                if not links.get(document_name) and data_id:
+                    token_rows += 1
+                    links.setdefault(document_name, self._download_button_fallback_url(base_url, document_name, data_id))
+
+        if available:
+            LOGGER.info(
+                "Detected Toronto document rows via Playwright locators for %s: rows_inspected=%s; token_rows=%s; required=%s; links=%s",
+                base_url,
+                rows_seen,
+                token_rows,
+                ", ".join(sorted(available)),
+                ", ".join(sorted(links)) or "none",
+            )
+        return links, available, rows_seen, token_rows
+
     def _extract_download_button_document_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
         """Extract Toronto Supporting Documentation rows from the exact DOM contract.
 
@@ -1397,6 +1660,15 @@ class TorontoOpenDataMonitor:
         available: set[str] = set()
         rows_seen = 0
         exact_token_rows = 0
+
+        locator_links, locator_available, locator_rows_seen, locator_token_rows = self._extract_download_button_document_rows_with_locators(page, base_url)
+        rows_seen += locator_rows_seen
+        exact_token_rows += locator_token_rows
+        for name in locator_available:
+            available.add(name)
+        for name, href in locator_links.items():
+            if href and not links.get(name):
+                links[name] = href
 
         js = r"""
         () => {
@@ -1683,8 +1955,38 @@ class TorontoOpenDataMonitor:
 
         return candidates
 
+    def _set_document_table_to_all_rows_with_locators(self, scope: Any, search_term: str = "") -> None:
+        """Use Playwright locators to search/show 100 rows, including open shadow DOM."""
+        term = normalize_key(search_term)
+        try:
+            inputs = scope.locator("input[type='search'], input[aria-label*='Search' i], input[placeholder*='Search' i]")
+            for index in range(min(inputs.count(), 8)):
+                try:
+                    inputs.nth(index).fill(term, timeout=800)
+                    inputs.nth(index).press("Enter", timeout=500)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            selects = scope.locator("select")
+            for index in range(min(selects.count(), 12)):
+                sel = selects.nth(index)
+                for value in ("100", "-1", "50", "25", "10"):
+                    try:
+                        sel.select_option(value=value, timeout=700)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
     def _set_document_table_to_all_rows(self, scope: Any, search_term: str = "") -> None:
         """Make the Supporting Documentation table expose matching rows in the DOM."""
+        try:
+            self._set_document_table_to_all_rows_with_locators(scope, search_term)
+        except Exception:
+            pass
         scope.evaluate(
             """
             (searchTerm) => {
@@ -1845,11 +2147,33 @@ class TorontoOpenDataMonitor:
         for scope in self._document_scopes(page):
             try:
                 texts = scope.evaluate(
-                    """
-                    () => Array.from(document.querySelectorAll('table tbody tr, table tr, [role="row"], li'))
-                        .map(el => el.innerText || el.textContent || '')
-                        .filter(Boolean)
-                        .slice(0, 500)
+                    r"""
+                    () => {
+                        const roots = [];
+                        const seenRoots = new Set();
+                        const addRoot = root => {
+                            if (!root || seenRoots.has(root)) return;
+                            seenRoots.add(root);
+                            roots.push(root);
+                            let nodes = [];
+                            try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                            for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+                        };
+                        addRoot(document);
+                        const out = [];
+                        const seen = new Set();
+                        for (const root of roots) {
+                            let nodes = [];
+                            try { nodes = Array.from(root.querySelectorAll('table tbody tr, table tr, [role="row"], li')); } catch (e) { nodes = []; }
+                            for (const el of nodes) {
+                                if (seen.has(el)) continue;
+                                seen.add(el);
+                                const text = el.innerText || el.textContent || '';
+                                if (text) out.push(text);
+                            }
+                        }
+                        return out.slice(0, 1000);
+                    }
                     """
                 )
             except Exception:
@@ -2194,20 +2518,35 @@ class TorontoOpenDataMonitor:
         click_js = r"""
         () => {
             const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-            for (const tr of document.querySelectorAll('table tbody tr, table tr, tr')) {
-                const cells = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
-                if (cells.length < 4) continue;
-                const first = normalize(cells[0].innerText || cells[0].textContent || '');
-                if (!/Application\s+Form/i.test(first)) continue;
-                let button = tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]');
-                if (!button) {
-                    button = Array.from(tr.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'))
-                        .find(el => /Download/i.test(el.innerText || el.textContent || el.value || ''));
+            const roots = [];
+            const seenRoots = new Set();
+            const addRoot = root => {
+                if (!root || seenRoots.has(root)) return;
+                seenRoots.add(root);
+                roots.push(root);
+                let nodes = [];
+                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+            };
+            addRoot(document);
+            for (const root of roots) {
+                let rows = [];
+                try { rows = Array.from(root.querySelectorAll('table tbody tr, table tr, tr, [role="row"]')); } catch (e) { rows = []; }
+                for (const tr of rows) {
+                    const cells = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
+                    if (cells.length < 4) continue;
+                    const first = normalize(cells[0].innerText || cells[0].textContent || '');
+                    if (!/Application\s+Form/i.test(first)) continue;
+                    let button = tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]');
+                    if (!button) {
+                        button = Array.from(tr.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'))
+                            .find(el => /Download/i.test(el.innerText || el.textContent || el.value || ''));
+                    }
+                    if (!button) continue;
+                    button.scrollIntoView({block: 'center', inline: 'center'});
+                    button.click();
+                    return {clicked: true, first, dataId: button.getAttribute('data-id') || ''};
                 }
-                if (!button) continue;
-                button.scrollIntoView({block: 'center', inline: 'center'});
-                button.click();
-                return {clicked: true, first, dataId: button.getAttribute('data-id') || ''};
             }
             return {clicked: false};
         }
