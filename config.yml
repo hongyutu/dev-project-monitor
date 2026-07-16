@@ -42,9 +42,9 @@ ottawa:
     - "Zoning By-law Amendment"
 
 news:
-  enabled: true
+  enabled: false
   max_posts_per_site: 50
-  lookback_days: 1
+  lookback_days: 7
   minimum_keyword_score: 2
   sites:
     - name: RENX
