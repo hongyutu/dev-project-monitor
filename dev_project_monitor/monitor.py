@@ -20,6 +20,7 @@ import smtplib
 import sqlite3
 import sys
 import tempfile
+import time
 import textwrap
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
@@ -681,7 +682,7 @@ class TorontoOpenDataMonitor:
         Browsers treat those ampersands as query separators unless we rebuild the
         URL, so canonicalize the query before Playwright opens the page.
         """
-        url = normalize_key(url)
+        url = html.unescape(normalize_key(url))
         if not url:
             return None
         if url.startswith("/"):
@@ -916,7 +917,12 @@ class TorontoOpenDataMonitor:
 
                         final_url = page.url
                         network_links, network_available = self._extract_network_document_data(network_recorder, final_url)
-                        button_links, button_available = self._extract_download_button_document_rows(page, final_url)
+
+                        # The reliable City signal is the exact row contract:
+                        # first <td> = Reference File and fourth <td> contains
+                        # button.downloadFile[data-id]. Wait/poll specifically for
+                        # that contract before falling back to broad HTML parsing.
+                        button_links, button_available = self._wait_for_toronto_download_rows(page, final_url)
 
                         # If DataTables is server-side or still paginating, use its own
                         # search box for each standardized file name. This is still fast:
@@ -940,6 +946,7 @@ class TorontoOpenDataMonitor:
                                             self._set_document_table_to_all_rows(scope, term)
                                         except Exception:
                                             pass
+                                    self._force_supporting_docs_visible(page)
                                     more_links, more_available = self._extract_download_button_document_rows(page, final_url)
                                     for name in more_available:
                                         button_available.add(name)
@@ -1100,11 +1107,157 @@ class TorontoOpenDataMonitor:
             if rows > 0:
                 return
 
+        # Final attempt for accordion variants whose clickable control is a wrapper
+        # rather than the visible text node.
+        self._force_supporting_docs_visible(page)
+
         # Final short wait for late-rendered Angular/DataTables content.
         try:
             page.wait_for_timeout(1500)
         except Exception:
             pass
+
+    def _force_supporting_docs_visible(self, page: Any) -> None:
+        """Aggressively open the Supporting Documentation UI without relying on one selector.
+
+        Toronto has changed this accordion several times. The document rows are
+        still regular table rows once the section is open, so this method clicks
+        likely controls and also removes common hidden/collapsed states.
+        """
+        js = r"""
+        () => {
+            const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const visible = el => {
+                try {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                } catch (e) { return false; }
+            };
+            const hasRows = () => Array.from(document.querySelectorAll('tr'))
+                .some(tr => /Application Form|Architectural|Civil|Geotechnical|Hydrogeological/i.test(tr.innerText || tr.textContent || '')
+                    && tr.querySelector('.downloadFile[data-id], button[data-id], a, button'));
+
+            let clicked = 0;
+            const clickCandidate = el => {
+                if (!el || clicked >= 8) return;
+                try {
+                    const target = el.closest('button,a,[role="button"],[aria-controls],summary,.accordion-button,.accordion-header,.panel-heading,.card-header,.btn') || el;
+                    target.scrollIntoView({block: 'center', inline: 'center'});
+                    target.click();
+                    clicked++;
+                } catch (e) {}
+            };
+
+            const all = Array.from(document.querySelectorAll('body *'));
+            for (const el of all) {
+                const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+                if (!text) continue;
+                if (/^Expand All$/i.test(text) || /^Supporting Documentation$/i.test(text) || /Supporting Documentation/i.test(text)) {
+                    if (visible(el)) clickCandidate(el);
+                    if (hasRows()) break;
+                }
+            }
+
+            for (const el of document.querySelectorAll('[hidden]')) {
+                if (/Supporting Documentation|Reference File|Application Form|Download/i.test(el.innerText || el.textContent || '')) {
+                    try { el.hidden = false; el.removeAttribute('hidden'); } catch (e) {}
+                }
+            }
+            for (const el of document.querySelectorAll('.collapse, .collapsed, [aria-expanded="false"]')) {
+                const text = el.innerText || el.textContent || '';
+                if (/Supporting Documentation|Reference File|Application Form|Download/i.test(text)) {
+                    try { el.classList.add('show'); el.classList.remove('collapsed'); } catch (e) {}
+                    try { el.setAttribute('aria-expanded', 'true'); } catch (e) {}
+                    try { el.style.display = 'block'; el.style.height = 'auto'; el.style.visibility = 'visible'; } catch (e) {}
+                }
+            }
+            return {clicked, hasRows: hasRows()};
+        }
+        """
+        for scope in self._document_scopes(page):
+            try:
+                result = scope.evaluate(js)
+                LOGGER.info("Toronto Supporting Documentation force-visible step: %s", result)
+            except Exception:
+                continue
+        try:
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
+    def _wait_for_toronto_download_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
+        """Poll for exact button.downloadFile[data-id] rows before declaring docs missing."""
+        timeout_seconds = float(self.config.get("document_rows_wait_seconds", 25) or 25)
+        deadline = time.monotonic() + timeout_seconds
+        best_links: dict[str, str] = {}
+        best_available: set[str] = set()
+        attempt = 0
+
+        while True:
+            attempt += 1
+            for scope in self._document_scopes(page):
+                try:
+                    self._set_document_table_to_all_rows(scope)
+                except Exception:
+                    pass
+
+            links, available = self._extract_download_button_document_rows(page, base_url)
+            for name in available:
+                best_available.add(name)
+            for name, href in links.items():
+                if href and not best_links.get(name):
+                    best_links[name] = href
+
+            if "Application Form" in best_available or len(best_available) >= 2:
+                LOGGER.info(
+                    "Toronto exact document rows ready for %s after %s attempt(s): %s",
+                    base_url,
+                    attempt,
+                    ", ".join(sorted(best_available)) or "none",
+                )
+                return best_links, best_available
+
+            # Wait for the exact DevTools structure the user observed.
+            try:
+                for scope in self._document_scopes(page):
+                    found = scope.evaluate(
+                        r"""
+                        () => Array.from(document.querySelectorAll('tr')).some(tr => {
+                            const cells = Array.from(tr.children).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
+                            return cells.length >= 4
+                                && /Application\s+Form/i.test(cells[0].innerText || cells[0].textContent || '')
+                                && tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]');
+                        })
+                        """
+                    )
+                    if found:
+                        links, available = self._extract_download_button_document_rows(page, base_url)
+                        for name in available:
+                            best_available.add(name)
+                        for name, href in links.items():
+                            if href and not best_links.get(name):
+                                best_links[name] = href
+                        return best_links, best_available
+            except Exception:
+                pass
+
+            if time.monotonic() >= deadline:
+                break
+
+            self._force_supporting_docs_visible(page)
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+        LOGGER.info(
+            "Toronto exact document rows timed out for %s after %.1fs; best=%s",
+            base_url,
+            timeout_seconds,
+            ", ".join(sorted(best_available)) or "none",
+        )
+        return best_links, best_available
 
     def _document_row_count(self, scope: Any) -> int:
         try:
@@ -1367,8 +1520,8 @@ class TorontoOpenDataMonitor:
             // Currently visible DOM rows. This is the path matching the DevTools
             // screenshot exactly: first td is the Reference File, fourth td has
             // button.downloadFile[data-id].
-            for (const tr of document.querySelectorAll('table tbody tr, table tr')) {
-                const tds = Array.from(tr.querySelectorAll(':scope > td'));
+            for (const tr of document.querySelectorAll('table tbody tr, table tr, tr')) {
+                const tds = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
                 const cells = tds.length ? tds.map(td => td.innerHTML || td.textContent || '') : [tr.innerHTML || tr.textContent || ''];
                 const firstCell = tds.length ? (tds[0].innerHTML || tds[0].textContent || '') : cells[0];
                 const attrs = collectAttrsFromRoot(tr);
@@ -1656,10 +1809,10 @@ class TorontoOpenDataMonitor:
 
     def _visible_document_rows(self, scope: Any, required_name: str) -> list[Any]:
         rows: list[Any] = []
-        selectors = "table tbody tr, table tr, [role='row']"
+        selectors = "table tbody tr, table tr, tr, [role='row']"
         try:
             locator = scope.locator(selectors)
-            count = min(locator.count(), 300)
+            count = min(locator.count(), 500)
         except Exception:
             return rows
 
@@ -1668,10 +1821,22 @@ class TorontoOpenDataMonitor:
             try:
                 text = normalize_key(row.inner_text(timeout=1200))
             except Exception:
-                continue
+                try:
+                    text = normalize_key(row.text_content(timeout=1200))
+                except Exception:
+                    continue
             if not text or "no matching records" in text.lower():
                 continue
-            if self._document_name_for_text(text) == required_name:
+
+            first_cell = ""
+            try:
+                cells = row.locator("td")
+                if cells.count() > 0:
+                    first_cell = normalize_key(cells.first.inner_text(timeout=800))
+            except Exception:
+                first_cell = ""
+
+            if (self._document_name_for_text(first_cell) or self._document_name_for_text(text)) == required_name:
                 rows.append(row)
         return rows
 
@@ -1977,6 +2142,10 @@ class TorontoOpenDataMonitor:
                     break
 
         if not rows:
+            LOGGER.info("Application Form row not visible as a Playwright locator for %s; trying exact JS downloadFile click", base_url)
+            js_text = self._extract_application_form_text_by_exact_js_click(page, base_url, timeout_ms)
+            if normalize_key(js_text):
+                return js_text
             LOGGER.info("Application Form row not visible for %s; contact extraction skipped", base_url)
             return ""
 
@@ -2018,6 +2187,60 @@ class TorontoOpenDataMonitor:
                 LOGGER.info("Could not download/parse Toronto Application Form for %s: %s", base_url, exc)
                 continue
 
+        return ""
+
+    def _extract_application_form_text_by_exact_js_click(self, page: Any, base_url: str, timeout_ms: int) -> str:
+        """Fallback: click button.downloadFile[data-id] in the Application Form row by JS."""
+        click_js = r"""
+        () => {
+            const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            for (const tr of document.querySelectorAll('table tbody tr, table tr, tr')) {
+                const cells = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
+                if (cells.length < 4) continue;
+                const first = normalize(cells[0].innerText || cells[0].textContent || '');
+                if (!/Application\s+Form/i.test(first)) continue;
+                let button = tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]');
+                if (!button) {
+                    button = Array.from(tr.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'))
+                        .find(el => /Download/i.test(el.innerText || el.textContent || el.value || ''));
+                }
+                if (!button) continue;
+                button.scrollIntoView({block: 'center', inline: 'center'});
+                button.click();
+                return {clicked: true, first, dataId: button.getAttribute('data-id') || ''};
+            }
+            return {clicked: false};
+        }
+        """
+        for scope in self._document_scopes(page):
+            try:
+                self._set_document_table_to_all_rows(scope, "Application Form")
+            except Exception:
+                pass
+        self._force_supporting_docs_visible(page)
+
+        try:
+            with page.expect_download(timeout=timeout_ms) as download_info:
+                result = page.evaluate(click_js)
+                LOGGER.info("Application Form exact JS click result for %s: %s", base_url, result)
+            download = download_info.value
+            file_bytes = self._read_playwright_download_bytes(download)
+            suggested_name = normalize_key(getattr(download, "suggested_filename", ""))
+            try:
+                download.delete()
+            except Exception:
+                pass
+            text = self._extract_application_form_text_from_bytes(file_bytes, suggested_name)
+            if normalize_key(text):
+                LOGGER.info(
+                    "Downloaded Toronto Application Form by exact JS click for %s; filename=%s; extracted_chars=%s",
+                    base_url,
+                    suggested_name or "unknown",
+                    len(text),
+                )
+                return text
+        except Exception as exc:
+            LOGGER.info("Exact JS Application Form download failed for %s: %s", base_url, exc)
         return ""
 
     def _read_playwright_download_bytes(self, download: Any) -> bytes:
