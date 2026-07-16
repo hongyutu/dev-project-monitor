@@ -8,7 +8,14 @@ toronto:
   ckan_base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
   package_id: "development-applications"
   fallback_csv_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/0aa7e480-9b48-4919-98e0-6af7615b7809/resource/77f8a66a-bd43-40e6-b6c9-12a2b03a5032/download/development-applications.csv"
-  max_records: 1000
+
+  # 0 means read the full CSV. Do not cap before filtering.
+  max_records: 0
+  raw_record_limit: 0
+
+  # Cap only after filtering/grouping.
+  max_candidates: 500
+
   lookback_days: 45
   application_types:
     - "OZ"
