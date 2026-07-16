@@ -710,112 +710,114 @@ class TorontoOpenDataMonitor:
                         user_agent=self.http.session.headers.get("User-Agent"),
                         accept_downloads=True,
                     )
-                    page = context.new_page()
-
-                    page.goto(
-                        url,
-                        wait_until="domcontentloaded",
-                        timeout=int(self.config.get("page_timeout_ms", 60000)),
-                    )
-
                     try:
-                        page.wait_for_load_state("networkidle", timeout=30000)
-                    except Exception:
-                        pass
+                        page = context.new_page()
 
-                    page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
-
-                    # A valid Toronto application page usually shows these labels.
-                    try:
-                        page.locator("body").filter(
-                            has_text=re.compile(
-                                r"Application Number|Application Status|Supporting Documentation",
-                                re.I,
-                            )
-                        ).wait_for(timeout=30000)
-                    except Exception:
-                        pass
-
-                    # Expand accordions.
-                    for label in ("Expand All", "Supporting Documentation"):
-                        try:
-                            matches = page.get_by_text(label, exact=False)
-                            count = min(matches.count(), 5)
-                            for i in range(count):
-                                try:
-                                    matches.nth(i).click(timeout=3000)
-                                    page.wait_for_timeout(750)
-                                except Exception:
-                                    continue
-                        except Exception:
-                            continue
-
-                # Supporting Documentation uses DataTables and defaults to 10 rows.
-                # Show all / 100 rows so documents on pages 2 and 3 are present.
-                try:
-                        page.evaluate(
-                            """
-                            () => {
-                            if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
-                                window.jQuery('table').each(function () {
-                                    try {
-                                        const dt = window.jQuery(this).DataTable();
-                                        dt.page.len(100).draw(false);
-                                    } catch (e) {}
-                                });
-                            }
-
-                            for (const sel of document.querySelectorAll('select')) {
-                                const opts = Array.from(sel.options || []);
-                                if (!opts.length) continue;
-                                let chosen =
-                                opts.find(o => o.value === '-1') ||
-                                opts.find(o => o.value === '100') ||
-                                opts.find(o => o.value === '50') ||
-                                opts[opts.length - 1];
-                                if (chosen) {
-                                sel.value = chosen.value;
-                                sel.dispatchEvent(new Event('change', { bubbles: true }));
-                                }
-                            }
-                            }
-                            """
+                        page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=int(self.config.get("page_timeout_ms", 60000)),
                         )
-                        page.wait_for_timeout(1500)
-                    except Exception as exc:
-                        LOGGER.info("Could not switch document table to all/100 entries for %s: %s", url, exc)
 
-                    # Scroll so lazy-rendered table content appears.
-                    try:
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        page.wait_for_timeout(1000)
-                    except Exception:
-                        pass
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=30000)
+                        except Exception:
+                            pass
 
-                    final_url = page.url
-                    html_text = page.content()
+                        page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
 
-                try:
-                    doc_row_count = page.evaluate(
-                        """
-                        () => Array.from(document.querySelectorAll('table tbody tr'))
-                            .filter(tr => (tr.innerText || '').includes('Download')).length
-                        """
-                    )
-                except Exception:
-                    doc_row_count = "unknown"
+                        # A valid Toronto application page usually shows these labels.
+                        try:
+                            page.locator("body").filter(
+                                has_text=re.compile(
+                                    r"Application Number|Application Status|Supporting Documentation",
+                                    re.I,
+                                )
+                            ).wait_for(timeout=30000)
+                        except Exception:
+                            pass
 
-                LOGGER.info("Rendered Toronto detail page length for %s: %s", final_url, len(html_text or ""))
-                LOGGER.info(
-                    "Supporting Documentation present for %s: %s; document rows: %s",
-                    final_url,
-                    "Supporting Documentation" in (html_text or ""),
-                    doc_row_count,
-                )
+                        # Expand accordions.
+                        for label in ("Expand All", "Supporting Documentation"):
+                            try:
+                                matches = page.get_by_text(label, exact=False)
+                                count = min(matches.count(), 5)
+                                for i in range(count):
+                                    try:
+                                        matches.nth(i).click(timeout=3000)
+                                        page.wait_for_timeout(750)
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                continue
 
-                    context.close()
-                    browser.close()
-                    return final_url, html_text
+                        # Supporting Documentation uses DataTables and defaults to 10 rows.
+                        # Force all / 100 rows so documents on pages 2 and 3 are present.
+                        try:
+                            page.evaluate(
+                                """
+                                () => {
+                                    if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+                                        window.jQuery('table').each(function () {
+                                            try {
+                                                const dt = window.jQuery(this).DataTable();
+                                                dt.page.len(100).draw(false);
+                                            } catch (e) {}
+                                        });
+                                    }
+
+                                    for (const sel of document.querySelectorAll('select')) {
+                                        const opts = Array.from(sel.options || []);
+                                        if (!opts.length) continue;
+                                        const chosen =
+                                            opts.find(o => o.value === '-1') ||
+                                            opts.find(o => o.value === '100') ||
+                                            opts.find(o => o.value === '50') ||
+                                            opts[opts.length - 1];
+                                        if (chosen) {
+                                            sel.value = chosen.value;
+                                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                        }
+                                    }
+                                }
+                                """
+                            )
+                            page.wait_for_timeout(1500)
+                        except Exception as exc:
+                            LOGGER.info("Could not switch document table to all/100 entries for %s: %s", url, exc)
+
+                        # Scroll so lazy-rendered table content appears.
+                        try:
+                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            page.wait_for_timeout(1000)
+                        except Exception:
+                            pass
+
+                        final_url = page.url
+                        html_text = page.content()
+
+                        try:
+                            doc_row_count = page.evaluate(
+                                """
+                                () => Array.from(document.querySelectorAll('table tbody tr'))
+                                    .filter(tr => (tr.innerText || '').includes('Download')).length
+                                """
+                            )
+                        except Exception:
+                            doc_row_count = "unknown"
+
+                        LOGGER.info("Rendered Toronto detail page length for %s: %s", final_url, len(html_text or ""))
+                        LOGGER.info(
+                            "Supporting Documentation present for %s: %s; document rows: %s",
+                            final_url,
+                            "Supporting Documentation" in (html_text or ""),
+                            doc_row_count,
+                        )
+
+                        return final_url, html_text
+                    finally:
+                        context.close()
+                        browser.close()
 
             except Exception as exc:
                 LOGGER.info(
@@ -930,14 +932,6 @@ class TorontoOpenDataMonitor:
             visible_text = element_context(element)
             for href in url_candidates(element):
                 maybe_capture(visible_text, href)
-
-            for attr_name, attr_value in element.attrs.items():
-                if attr_name.lower().startswith("data") or attr_name.lower() in {
-                    "href",
-                    "src",
-                    "onclick",
-                }:
-                    maybe_capture(visible_text, str(attr_value))
 
         return docs
 
