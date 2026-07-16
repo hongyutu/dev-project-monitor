@@ -698,26 +698,103 @@ class TorontoOpenDataMonitor:
         return url
 
     def _fetch_rendered_page(self, url: str) -> tuple[str, str]:
-        """Return final URL and HTML. Playwright is used when installed.
-
-        Requests can only see Toronto's JS shell. Playwright is optional but is
-        needed to see the document links rendered on the application page.
-        """
+        """Render Toronto application page and expand Supporting Documentation."""
         if self.config.get("render_with_playwright", True):
             try:
                 from playwright.sync_api import sync_playwright
 
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
-                    page = browser.new_page()
-                    page.goto(url, wait_until="networkidle", timeout=int(self.config.get("page_timeout_ms", 60000)))
+                    context = browser.new_context(
+                        viewport={"width": 1365, "height": 2200},
+                        user_agent=self.http.session.headers.get("User-Agent"),
+                        accept_downloads=True,
+                    )
+                    page = context.new_page()
+
+                    page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=int(self.config.get("page_timeout_ms", 60000)),
+                    )
+
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=30000)
+                    except Exception:
+                        pass
+
                     page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
+
+                    # A valid Toronto application page usually shows these labels.
+                    try:
+                        page.locator("body").filter(
+                            has_text=re.compile(
+                                r"Application Number|Application Status|Supporting Documentation",
+                                re.I,
+                            )
+                        ).wait_for(timeout=30000)
+                    except Exception:
+                        pass
+
+                    # Expand accordions.
+                    for label in ("Expand All", "Supporting Documentation"):
+                        try:
+                            matches = page.get_by_text(label, exact=False)
+                            count = min(matches.count(), 5)
+                            for i in range(count):
+                                try:
+                                    matches.nth(i).click(timeout=3000)
+                                    page.wait_for_timeout(750)
+                                except Exception:
+                                    continue
+                        except Exception:
+                            continue
+
+                    # Some DataTables default to 1/10 entries. Switch to the largest option.
+                    try:
+                        page.evaluate(
+                            """
+                            () => {
+                            for (const sel of document.querySelectorAll('select')) {
+                                const opts = Array.from(sel.options || []);
+                                if (!opts.length) continue;
+                                let chosen =
+                                opts.find(o => o.value === '-1') ||
+                                opts.find(o => o.value === '100') ||
+                                opts.find(o => o.value === '50') ||
+                                opts[opts.length - 1];
+                                if (chosen) {
+                                sel.value = chosen.value;
+                                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                }
+                            }
+                            }
+                            """
+                        )
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+
+                    # Scroll so lazy-rendered table content appears.
+                    try:
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+
                     html_text = page.content()
                     final_url = page.url
+
+                    context.close()
                     browser.close()
                     return final_url, html_text
+
             except Exception as exc:
-                LOGGER.info("Playwright render unavailable for %s; falling back to requests: %s", url, exc)
+                LOGGER.info(
+                    "Playwright render unavailable for %s; falling back to requests: %s",
+                    url,
+                    exc,
+                )
 
         response = self.http.get(url)
         return response.url, response.text
@@ -727,34 +804,44 @@ class TorontoOpenDataMonitor:
         return any(marker in page_text for marker in ("page not found", "404", "access denied", "forbidden"))
 
     def _extract_document_links(self, html_text: str, base_url: str) -> dict[str, str]:
+        """Extract required links from the rendered Supporting Documentation table."""
         soup = BeautifulSoup(html_text or "", "html.parser")
         docs = {name: "" for name in self.REQUIRED_DOCUMENTS}
 
-        for link in soup.find_all(["a", "button"], href=True):
-            href = normalize_key(link.get("href"))
-            if not href or href.startswith("#"):
-                continue
-            text = normalize_key(" ".join([link.get_text(" ", strip=True), href]))
-            lowered = text.lower()
+        def maybe_capture(label_text: str, href: str) -> None:
+            text = normalize_key(label_text)
+            href = normalize_key(href)
+            if not text or not href:
+                return
+
+            lowered = f"{text} {href}".lower()
             full_url = urljoin(base_url, href)
+
             for name, patterns in self.REQUIRED_DOCUMENTS.items():
-                if not docs[name] and any(re.search(pattern, lowered, flags=re.I) for pattern in patterns):
+                if docs.get(name):
+                    continue
+                if any(re.search(pattern, lowered, flags=re.I) for pattern in patterns):
                     docs[name] = full_url
 
-        # Some JS components store URLs in data attributes instead of hrefs.
+        # Normal anchors.
+        for link in soup.find_all("a", href=True):
+            maybe_capture(link.get_text(" ", strip=True), link.get("href"))
+
+        # Table rows sometimes hold the link in onclick/data attributes.
         for element in soup.find_all(True):
-            attrs = " ".join(str(v) for v in element.attrs.values())
-            if not attrs:
-                continue
-            text = normalize_key(" ".join([element.get_text(" ", strip=True), attrs]))
-            lowered = text.lower()
-            url_match = re.search(r"https?://[^\s'\"]+", attrs)
-            if not url_match:
-                continue
-            full_url = html.unescape(url_match.group(0))
-            for name, patterns in self.REQUIRED_DOCUMENTS.items():
-                if not docs[name] and any(re.search(pattern, lowered, flags=re.I) for pattern in patterns):
-                    docs[name] = full_url
+            visible_text = normalize_key(element.get_text(" ", strip=True))
+            attrs_text = " ".join(str(v) for v in element.attrs.values())
+
+            for match in re.findall(r"https?://[^\s'\"<>]+", attrs_text):
+                maybe_capture(visible_text, html.unescape(match))
+
+            for attr_name, attr_value in element.attrs.items():
+                if attr_name.lower().startswith("data") or attr_name.lower() in {
+                    "href",
+                    "src",
+                    "onclick",
+                }:
+                    maybe_capture(visible_text, str(attr_value))
 
         return docs
 

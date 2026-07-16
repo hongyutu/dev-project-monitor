@@ -20,6 +20,8 @@ toronto:
   - RH
   render_with_playwright: true
   ocr_image_pdfs: true
+  page_timeout_ms: 60000
+  post_load_wait_ms: 2500
 ottawa:
   enabled: false
   export_url: https://devapps-restapi.ottawa.ca/devapps/ExportData
