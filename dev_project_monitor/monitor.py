@@ -23,7 +23,7 @@ import textwrap
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from typing import Any, Iterable
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, urlencode, unquote_plus, urljoin, urlparse
 
 import feedparser
 import requests
@@ -659,9 +659,10 @@ class TorontoOpenDataMonitor:
     def _application_details_url(self, url: Any) -> str | None:
         """Normalize a Toronto AIC/application URL.
 
-        The Toronto page is JavaScript-rendered and often appears as only
-        "Loading" to requests, so URL shape is used for link status. Legacy AIC
-        URLs are converted to the current application-details URL with folderRsn.
+        Toronto's current AIC links use id, pid, and title. Some CSV rows contain
+        a title value with raw ampersands, for example ``title=2 & 10 ...``.
+        Browsers treat those ampersands as query separators unless we rebuild the
+        URL, so canonicalize the query before Playwright opens the page.
         """
         url = normalize_key(url)
         if not url:
@@ -674,15 +675,23 @@ class TorontoOpenDataMonitor:
             return None
 
         host = parsed.netloc.lower()
-        params = parse_qs(parsed.query)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+
+        def first_param(*names: str) -> str:
+            for name in names:
+                values = params.get(name) or params.get(name.lower()) or params.get(name.upper())
+                if values and normalize_key(values[0]):
+                    return normalize_key(values[0])
+            return ""
 
         if self._is_legacy_toronto_url(url):
-            folder_rsn = (params.get("folderRsn") or params.get("folderrsn") or [""])[0]
+            folder_rsn = first_param("folderRsn", "folderrsn")
             if not folder_rsn:
                 return None
             return (
                 "https://www.toronto.ca/city-government/planning-development/"
-                f"application-details/?folderRsn={quote_plus(folder_rsn)}"
+                "application-details/?"
+                + urlencode({"folderRsn": folder_rsn})
             )
 
         if "toronto.ca" not in host:
@@ -690,12 +699,55 @@ class TorontoOpenDataMonitor:
         if "/application-details/" not in parsed.path:
             return None
 
-        has_folder = bool((params.get("folderRsn") or params.get("folderrsn") or [""])[0])
-        has_id_pid_title = all((params.get(key) or [""])[0] for key in ("id", "pid", "title"))
-        if not (has_folder or has_id_pid_title):
+        folder_rsn = first_param("folderRsn", "folderrsn")
+        if folder_rsn:
+            return (
+                "https://www.toronto.ca/city-government/planning-development/"
+                "application-details/?"
+                + urlencode({"folderRsn": folder_rsn})
+            )
+
+        app_id = first_param("id")
+        pid = first_param("pid")
+        title = ""
+        title_match = re.search(r"(?:\?|&)title=([^#]*)", url, flags=re.I)
+        if title_match:
+            # Capture to the end so raw ampersands inside title are preserved,
+            # then urlencode below turns them into %26.
+            title = normalize_key(unquote_plus(title_match.group(1)))
+        title = title or first_param("title")
+
+        if not (app_id and pid and title):
             return None
 
-        return url
+        return (
+            "https://www.toronto.ca/city-government/planning-development/"
+            "application-details/?"
+            + urlencode({"id": app_id, "pid": pid, "title": title})
+        )
+
+    def _document_name_for_text(self, text: Any) -> str:
+        lowered = normalize_key(text).lower()
+        if not lowered:
+            return ""
+        for name, patterns in self.REQUIRED_DOCUMENTS.items():
+            if any(re.search(pattern, lowered, flags=re.I) for pattern in patterns):
+                return name
+        return ""
+
+    def _download_links_fixture_html(self, document_links: dict[str, str]) -> str:
+        if not document_links:
+            return ""
+        rows = []
+        for name, href in document_links.items():
+            if not href:
+                continue
+            rows.append(
+                f'<tr><td>{html.escape(name)}</td><td><a href="{html.escape(href, quote=True)}">Download</a></td></tr>'
+            )
+        if not rows:
+            return ""
+        return "\n<div id=\"captured-toronto-document-links\"><table><tbody>" + "".join(rows) + "</tbody></table></div>\n"
 
     def _fetch_rendered_page(self, url: str) -> tuple[str, str]:
         """Render Toronto application page and expand Supporting Documentation."""
@@ -754,35 +806,7 @@ class TorontoOpenDataMonitor:
                         # Supporting Documentation uses DataTables and defaults to 10 rows.
                         # Force all / 100 rows so documents on pages 2 and 3 are present.
                         try:
-                            page.evaluate(
-                                """
-                                () => {
-                                    if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
-                                        window.jQuery('table').each(function () {
-                                            try {
-                                                const dt = window.jQuery(this).DataTable();
-                                                dt.page.len(100).draw(false);
-                                            } catch (e) {}
-                                        });
-                                    }
-
-                                    for (const sel of document.querySelectorAll('select')) {
-                                        const opts = Array.from(sel.options || []);
-                                        if (!opts.length) continue;
-                                        const chosen =
-                                            opts.find(o => o.value === '-1') ||
-                                            opts.find(o => o.value === '100') ||
-                                            opts.find(o => o.value === '50') ||
-                                            opts[opts.length - 1];
-                                        if (chosen) {
-                                            sel.value = chosen.value;
-                                            sel.dispatchEvent(new Event('change', { bubbles: true }));
-                                        }
-                                    }
-                                }
-                                """
-                            )
-                            page.wait_for_timeout(1500)
+                            self._set_document_table_to_all_rows(page)
                         except Exception as exc:
                             LOGGER.info("Could not switch document table to all/100 entries for %s: %s", url, exc)
 
@@ -794,7 +818,8 @@ class TorontoOpenDataMonitor:
                             pass
 
                         final_url = page.url
-                        html_text = page.content()
+                        captured_document_links = self._capture_document_download_links(page, final_url)
+                        html_text = page.content() + self._download_links_fixture_html(captured_document_links)
 
                         try:
                             doc_row_count = page.evaluate(
@@ -808,10 +833,11 @@ class TorontoOpenDataMonitor:
 
                         LOGGER.info("Rendered Toronto detail page length for %s: %s", final_url, len(html_text or ""))
                         LOGGER.info(
-                            "Supporting Documentation present for %s: %s; document rows: %s",
+                            "Supporting Documentation present for %s: %s; document rows: %s; captured document links: %s",
                             final_url,
                             "Supporting Documentation" in (html_text or ""),
                             doc_row_count,
+                            len(captured_document_links),
                         )
 
                         return final_url, html_text
@@ -828,6 +854,347 @@ class TorontoOpenDataMonitor:
 
         response = self.http.get(url)
         return response.url, response.text
+
+    def _set_document_table_to_all_rows(self, page: Any, search_term: str = "") -> None:
+        """Make the Supporting Documentation DataTable expose matching rows in the DOM."""
+        page.evaluate(
+            """
+            (searchTerm) => {
+                const terms = (searchTerm || '').trim();
+
+                if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+                    window.jQuery('table').each(function () {
+                        try {
+                            const dt = window.jQuery(this).DataTable();
+                            dt.search(terms);
+                            dt.page.len(100).draw(false);
+                        } catch (e) {}
+                    });
+                }
+
+                if (window.DataTable && window.DataTable.tables) {
+                    try {
+                        for (const table of window.DataTable.tables({visible: true})) {
+                            try {
+                                const dt = new window.DataTable(table);
+                                if (dt.search) dt.search(terms);
+                                if (dt.page && dt.page.len) dt.page.len(100).draw(false);
+                            } catch (e) {}
+                        }
+                    } catch (e) {}
+                }
+
+                for (const input of document.querySelectorAll('input[type="search"], input[aria-label*="Search" i]')) {
+                    input.value = terms;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('keyup', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                for (const sel of document.querySelectorAll('select')) {
+                    const opts = Array.from(sel.options || []);
+                    if (!opts.length) continue;
+                    const chosen =
+                        opts.find(o => o.value === '-1') ||
+                        opts.find(o => o.value === '100') ||
+                        opts.find(o => o.value === '50') ||
+                        opts[opts.length - 1];
+                    if (chosen) {
+                        sel.value = chosen.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }
+            }
+            """,
+            search_term,
+        )
+        page.wait_for_timeout(800)
+
+    def _row_url_candidates(self, row: Any, base_url: str) -> list[str]:
+        try:
+            raw_values = row.evaluate(
+                """
+                (row) => {
+                    const values = [];
+                    const add = (value) => {
+                        if (value !== undefined && value !== null && String(value).trim()) {
+                            values.push(String(value));
+                        }
+                    };
+                    const nodes = [row, ...row.querySelectorAll('a, button, input, [onclick], [data-href], [data-url], [data-download-url], [data-document-url], [data-file-url]')];
+                    for (const node of nodes) {
+                        if (!node.getAttributeNames) continue;
+                        for (const attr of node.getAttributeNames()) {
+                            const lower = attr.toLowerCase();
+                            if (['href', 'src', 'formaction', 'onclick'].includes(lower) || lower.startsWith('data')) {
+                                add(node.getAttribute(attr));
+                            }
+                        }
+                    }
+                    return values;
+                }
+                """
+            )
+        except Exception:
+            raw_values = []
+
+        candidates: list[str] = []
+        for value in raw_values or []:
+            raw = html.unescape(str(value or "")).strip()
+            if not raw:
+                continue
+            pieces = []
+            pieces.extend(re.findall(r"https?://[^\s'\"<>\\)]+", raw, flags=re.I))
+            pieces.extend(re.findall(r"(?<![A-Za-z0-9])(/[^\s'\"<>\\)]+)", raw))
+            pieces.extend(
+                re.findall(
+                    r"['\"]([^'\"]*(?:download|document|attachment|file)[^'\"]*)['\"]",
+                    raw,
+                    flags=re.I,
+                )
+            )
+            if not pieces:
+                lowered = raw.lower()
+                if (
+                    not lowered.startswith(("javascript:", "mailto:", "tel:", "#", "blob:"))
+                    and ("/" in raw or "download" in lowered or "document" in lowered or "file" in lowered)
+                ):
+                    pieces.append(raw)
+            for piece in pieces:
+                piece = normalize_key(piece)
+                lowered_piece = piece.lower()
+                if not piece or lowered_piece.startswith(("javascript:", "mailto:", "tel:", "#", "blob:")):
+                    continue
+                full_url = urljoin(base_url, piece)
+                if full_url not in candidates:
+                    candidates.append(full_url)
+        return candidates
+
+    def _visible_document_rows(self, page: Any, required_name: str) -> list[Any]:
+        rows: list[Any] = []
+        try:
+            locator = page.locator("table tbody tr")
+            count = min(locator.count(), 200)
+        except Exception:
+            return rows
+
+        for index in range(count):
+            row = locator.nth(index)
+            try:
+                text = normalize_key(row.inner_text(timeout=1000))
+            except Exception:
+                continue
+            if not text or "no matching records" in text.lower():
+                continue
+            if self._document_name_for_text(text) == required_name:
+                rows.append(row)
+        return rows
+
+    def _click_row_download_for_url(self, page: Any, row: Any, base_url: str, required_name: str) -> str:
+        downloads: list[Any] = []
+        popups: list[Any] = []
+        requests_seen: list[str] = []
+        responses_seen: list[str] = []
+
+        def useful_url(candidate: str | None) -> str:
+            candidate = normalize_key(candidate)
+            if not candidate:
+                return ""
+            lowered = candidate.lower()
+            if lowered.startswith(("blob:", "about:", "javascript:", "mailto:", "tel:")):
+                return ""
+            return urljoin(base_url, candidate)
+
+        def on_download(download: Any) -> None:
+            downloads.append(download)
+
+        def on_popup(popup: Any) -> None:
+            popups.append(popup)
+
+        def on_request(request: Any) -> None:
+            try:
+                request_url = request.url
+            except Exception:
+                return
+            lowered = request_url.lower()
+            if any(token in lowered for token in ("download", "document", "attachment", "file", "aic", "application")):
+                requests_seen.append(request_url)
+
+        def on_response(response: Any) -> None:
+            try:
+                response_url = response.url
+                headers = {k.lower(): v for k, v in (response.headers or {}).items()}
+            except Exception:
+                return
+            lowered = response_url.lower()
+            content_disposition = headers.get("content-disposition", "").lower()
+            if "attachment" in content_disposition or any(token in lowered for token in ("download", "document", "attachment", "file")):
+                responses_seen.append(response_url)
+
+        try:
+            page.on("download", on_download)
+            page.on("popup", on_popup)
+            page.on("request", on_request)
+            page.on("response", on_response)
+        except Exception:
+            pass
+
+        before_url = page.url
+        try:
+            try:
+                page.evaluate(
+                    """
+                    () => {
+                        if (!window.__torontoCapturedOpenInstalled) {
+                            window.__torontoCapturedOpenInstalled = true;
+                            window.__torontoCapturedOpens = [];
+                            const originalOpen = window.open;
+                            window.open = function(url, ...args) {
+                                try { window.__torontoCapturedOpens.push(String(url || '')); } catch (e) {}
+                                if (originalOpen) return originalOpen.call(window, url, ...args);
+                                return null;
+                            };
+                        } else {
+                            window.__torontoCapturedOpens = [];
+                        }
+                    }
+                    """
+                )
+            except Exception:
+                pass
+
+            control = row.locator("a:has-text('Download'), button:has-text('Download'), input[value*='Download']").first
+            try:
+                if control.count() == 0:
+                    control = row.locator("a, button, input[type='button'], input[type='submit'], [role='button']").first
+            except Exception:
+                pass
+
+            try:
+                control.click(timeout=5000, no_wait_after=True)
+            except Exception as exc:
+                LOGGER.info("Could not click %s document download button: %s", required_name, exc)
+                return ""
+
+            page.wait_for_timeout(2500)
+
+            for download in reversed(downloads):
+                candidate = useful_url(getattr(download, "url", ""))
+                try:
+                    download.cancel()
+                except Exception:
+                    pass
+                if candidate:
+                    return candidate
+
+            for popup in reversed(popups):
+                try:
+                    popup.wait_for_load_state("domcontentloaded", timeout=3000)
+                except Exception:
+                    pass
+                candidate = useful_url(getattr(popup, "url", ""))
+                try:
+                    popup.close()
+                except Exception:
+                    pass
+                if candidate:
+                    return candidate
+
+            try:
+                opened = page.evaluate("window.__torontoCapturedOpens || []") or []
+            except Exception:
+                opened = []
+            for candidate in reversed(opened):
+                candidate = useful_url(candidate)
+                if candidate:
+                    return candidate
+
+            candidate = useful_url(page.url)
+            if candidate and candidate != before_url:
+                try:
+                    page.go_back(wait_until="domcontentloaded", timeout=5000)
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+                return candidate
+
+            for candidate in reversed(responses_seen + requests_seen):
+                candidate = useful_url(candidate)
+                if not candidate or candidate == before_url:
+                    continue
+                lowered = candidate.lower()
+                if any(ext in lowered for ext in (".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff")):
+                    continue
+                return candidate
+        finally:
+            try:
+                page.remove_listener("download", on_download)
+                page.remove_listener("popup", on_popup)
+                page.remove_listener("request", on_request)
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
+
+        return ""
+
+    def _capture_document_download_links(self, page: Any, base_url: str) -> dict[str, str]:
+        """Capture URLs hidden behind Toronto's JavaScript Download buttons.
+
+        The Supporting Documentation table can render the action as a plain
+        button, not as an ``<a href>``. In that case, static HTML extraction sees
+        the Reference File names but no document URLs. This method clicks only
+        the rows that match the required document types and records the download,
+        popup, navigation, or network URL triggered by the click.
+        """
+        captured: dict[str, str] = {}
+        search_terms = {
+            "Application Form": ["Application Form"],
+            "Architectural Plans": ["Architectural Plans", "Architectural"],
+            "Civil and Utilities Plans": ["Civil and Utilities Plans", "Utilities", "Civil"],
+            "Geotechnical Study": ["Geotechnical Study", "Geotechnical"],
+            "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater"],
+        }
+
+        try:
+            self._set_document_table_to_all_rows(page)
+        except Exception as exc:
+            LOGGER.info("Could not expose all document rows before download capture for %s: %s", base_url, exc)
+
+        for required_name in self.REQUIRED_DOCUMENTS:
+            rows = self._visible_document_rows(page, required_name)
+            if not rows:
+                for term in search_terms.get(required_name, [required_name]):
+                    try:
+                        self._set_document_table_to_all_rows(page, term)
+                    except Exception:
+                        continue
+                    rows = self._visible_document_rows(page, required_name)
+                    if rows:
+                        break
+
+            for row in rows[:2]:
+                for candidate in self._row_url_candidates(row, base_url):
+                    if candidate:
+                        captured[required_name] = candidate
+                        break
+                if captured.get(required_name):
+                    break
+
+                clicked_url = self._click_row_download_for_url(page, row, base_url, required_name)
+                if clicked_url:
+                    captured[required_name] = clicked_url
+                    break
+
+            try:
+                self._set_document_table_to_all_rows(page)
+            except Exception:
+                pass
+
+        if captured:
+            LOGGER.info("Captured %d Toronto document download link(s) for %s: %s", len(captured), base_url, ", ".join(sorted(captured)))
+        else:
+            LOGGER.info("No Toronto document download links captured for %s", base_url)
+        return captured
 
     def _looks_expired(self, html_text: str) -> bool:
         page_text = BeautifulSoup(html_text or "", "html.parser").get_text(" ", strip=True).lower()
