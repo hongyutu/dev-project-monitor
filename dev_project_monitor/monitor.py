@@ -735,22 +735,94 @@ class TorontoOpenDataMonitor:
                 return name
         return ""
 
-    def _download_links_fixture_html(self, document_links: dict[str, str]) -> str:
-        if not document_links:
+    def _supporting_docs_anchor(self, base_url: str) -> str:
+        base_url = normalize_key(base_url)
+        if not base_url:
             return ""
-        rows = []
-        for name, href in document_links.items():
+        return base_url.split("#", 1)[0] + "#supporting-documentation"
+
+    def _is_static_asset_url(self, url: str) -> bool:
+        lowered = normalize_key(url).lower().split("?", 1)[0]
+        return lowered.endswith(
+            (
+                ".css",
+                ".js",
+                ".mjs",
+                ".map",
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".gif",
+                ".svg",
+                ".webp",
+                ".ico",
+                ".woff",
+                ".woff2",
+                ".ttf",
+                ".eot",
+            )
+        )
+
+    def _is_meaningful_document_url(self, candidate: str, base_url: str) -> bool:
+        candidate = normalize_key(candidate)
+        if not candidate:
+            return False
+        lowered = candidate.lower()
+        if lowered.startswith(("blob:", "about:", "javascript:", "mailto:", "tel:", "#")):
+            return False
+        full_url = urljoin(base_url, candidate)
+        if self._is_static_asset_url(full_url):
+            return False
+
+        base_no_hash = normalize_key(base_url).split("#", 1)[0]
+        full_no_hash = full_url.split("#", 1)[0]
+        if base_no_hash and full_no_hash == base_no_hash:
+            return False
+
+        parsed = urlparse(full_url)
+        if "/application-details/" in parsed.path and not re.search(r"download|document|attachment|file", parsed.query, re.I):
+            return False
+
+        return True
+
+    def _download_links_fixture_html(
+        self,
+        document_links: dict[str, str],
+        available_document_names: Iterable[str] | None = None,
+        base_url: str = "",
+    ) -> str:
+        rows: list[str] = []
+        seen: set[str] = set()
+        for name, href in (document_links or {}).items():
             if not href:
                 continue
             rows.append(
-                f'<tr><td>{html.escape(name)}</td><td><a href="{html.escape(href, quote=True)}">Download</a></td></tr>'
+                f'<tr data-captured-document="true"><td>{html.escape(name)}</td>'
+                f'<td><a href="{html.escape(href, quote=True)}">Download</a></td></tr>'
             )
+            seen.add(name)
+
+        # Last-resort but important: the Toronto UI sometimes hides the real
+        # download URL behind JavaScript/blob handling. When we can prove the
+        # required row exists, expose the application details page instead of
+        # incorrectly reporting "Not found". The notification then still gives
+        # the user the correct page and row to search/click.
+        fallback_href = self._supporting_docs_anchor(base_url)
+        for name in sorted(set(available_document_names or []), key=lambda x: list(self.REQUIRED_DOCUMENTS).index(x) if x in self.REQUIRED_DOCUMENTS else 999):
+            if name in seen or not fallback_href:
+                continue
+            rows.append(
+                f'<tr data-captured-document="available-on-page"><td>{html.escape(name)}</td>'
+                f'<td><a href="{html.escape(fallback_href, quote=True)}">Available in Supporting Documentation</a></td></tr>'
+            )
+            seen.add(name)
+
         if not rows:
             return ""
         return "\n<div id=\"captured-toronto-document-links\"><table><tbody>" + "".join(rows) + "</tbody></table></div>\n"
 
     def _fetch_rendered_page(self, url: str) -> tuple[str, str]:
-        """Render Toronto application page and expand Supporting Documentation."""
+        """Render Toronto application page and expand/capture Supporting Documentation."""
         if self.config.get("render_with_playwright", True):
             try:
                 from playwright.sync_api import sync_playwright
@@ -758,12 +830,13 @@ class TorontoOpenDataMonitor:
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
                     context = browser.new_context(
-                        viewport={"width": 1365, "height": 2200},
+                        viewport={"width": 1365, "height": 2400},
                         user_agent=self.http.session.headers.get("User-Agent"),
                         accept_downloads=True,
                     )
                     try:
                         page = context.new_page()
+                        network_recorder = self._install_toronto_network_recorder(page)
 
                         page.goto(
                             url,
@@ -778,37 +851,25 @@ class TorontoOpenDataMonitor:
 
                         page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
 
-                        # A valid Toronto application page usually shows these labels.
+                        # A valid Toronto application page usually shows these labels, but do not
+                        # fail here: the app can render the document table before all labels settle.
                         try:
                             page.locator("body").filter(
                                 has_text=re.compile(
-                                    r"Application Number|Application Status|Supporting Documentation",
+                                    r"Application Number|Application Status|Supporting Documentation|Reference File|Download",
                                     re.I,
                                 )
                             ).wait_for(timeout=30000)
                         except Exception:
                             pass
 
-                        # Expand accordions.
-                        for label in ("Expand All", "Supporting Documentation"):
-                            try:
-                                matches = page.get_by_text(label, exact=False)
-                                count = min(matches.count(), 5)
-                                for i in range(count):
-                                    try:
-                                        matches.nth(i).click(timeout=3000)
-                                        page.wait_for_timeout(750)
-                                    except Exception:
-                                        continue
-                            except Exception:
-                                continue
+                        self._expand_supporting_documentation(page)
 
-                        # Supporting Documentation uses DataTables and defaults to 10 rows.
-                        # Force all / 100 rows so documents on pages 2 and 3 are present.
-                        try:
-                            self._set_document_table_to_all_rows(page)
-                        except Exception as exc:
-                            LOGGER.info("Could not switch document table to all/100 entries for %s: %s", url, exc)
+                        for scope in self._document_scopes(page):
+                            try:
+                                self._set_document_table_to_all_rows(scope)
+                            except Exception as exc:
+                                LOGGER.info("Could not switch document table to all/100 entries for %s: %s", url, exc)
 
                         # Scroll so lazy-rendered table content appears.
                         try:
@@ -818,26 +879,31 @@ class TorontoOpenDataMonitor:
                             pass
 
                         final_url = page.url
-                        captured_document_links = self._capture_document_download_links(page, final_url)
-                        html_text = page.content() + self._download_links_fixture_html(captured_document_links)
+                        network_links, network_available = self._extract_network_document_data(network_recorder, final_url)
+                        captured_links, clicked_available = self._capture_document_download_links(page, final_url)
+
+                        document_links = dict(network_links)
+                        document_links.update({k: v for k, v in captured_links.items() if v})
+
+                        visible_available = self._document_names_visible_on_page(page)
+                        available_names = set(network_available) | set(clicked_available) | set(visible_available) | set(document_links)
+
+                        html_text = self._combined_page_content(page)
+                        html_text += self._download_links_fixture_html(document_links, available_names, final_url)
 
                         try:
-                            doc_row_count = page.evaluate(
-                                """
-                                () => Array.from(document.querySelectorAll('table tbody tr'))
-                                    .filter(tr => (tr.innerText || '').includes('Download')).length
-                                """
-                            )
+                            doc_row_count = sum(self._document_row_count(scope) for scope in self._document_scopes(page))
                         except Exception:
                             doc_row_count = "unknown"
 
                         LOGGER.info("Rendered Toronto detail page length for %s: %s", final_url, len(html_text or ""))
                         LOGGER.info(
-                            "Supporting Documentation present for %s: %s; document rows: %s; captured document links: %s",
+                            "Supporting Documentation for %s: rows=%s; direct_links=%s; available_rows=%s; names=%s",
                             final_url,
-                            "Supporting Documentation" in (html_text or ""),
                             doc_row_count,
-                            len(captured_document_links),
+                            len(document_links),
+                            len(available_names),
+                            ", ".join(sorted(available_names)) or "none",
                         )
 
                         return final_url, html_text
@@ -855,19 +921,272 @@ class TorontoOpenDataMonitor:
         response = self.http.get(url)
         return response.url, response.text
 
-    def _set_document_table_to_all_rows(self, page: Any, search_term: str = "") -> None:
-        """Make the Supporting Documentation DataTable expose matching rows in the DOM."""
-        page.evaluate(
+    def _document_scopes(self, page: Any) -> list[Any]:
+        scopes: list[Any] = [page]
+        try:
+            for frame in page.frames:
+                if frame is not page.main_frame:
+                    scopes.append(frame)
+        except Exception:
+            pass
+        return scopes
+
+    def _combined_page_content(self, page: Any) -> str:
+        parts: list[str] = []
+        for scope in self._document_scopes(page):
+            try:
+                parts.append(scope.content())
+            except Exception:
+                continue
+        return "\n".join(parts)
+
+    def _expand_supporting_documentation(self, page: Any) -> None:
+        labels = (
+            r"Expand\s+All",
+            r"Supporting\s+Documentation",
+            r"Supporting\s+Documents",
+            r"Reference\s+File",
+        )
+        for scope in self._document_scopes(page):
+            for label_pattern in labels:
+                pattern = re.compile(label_pattern, re.I)
+                for locator_getter in (
+                    lambda: scope.get_by_role("button", name=pattern),
+                    lambda: scope.get_by_role("link", name=pattern),
+                    lambda: scope.get_by_text(pattern),
+                ):
+                    try:
+                        matches = locator_getter()
+                        count = min(matches.count(), 8)
+                    except Exception:
+                        continue
+                    for i in range(count):
+                        try:
+                            matches.nth(i).click(timeout=3000, no_wait_after=True)
+                            page.wait_for_timeout(700)
+                        except Exception:
+                            continue
+
+        # Give the table a chance to render after expansion.
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+    def _document_row_count(self, scope: Any) -> int:
+        try:
+            return int(
+                scope.evaluate(
+                    """
+                    () => Array.from(document.querySelectorAll('table tbody tr, [role="row"]'))
+                        .filter(tr => /Download|Reference File|Application Form|Architectural|Civil|Geotechnical|Hydro/i.test(tr.innerText || ''))
+                        .length
+                    """
+                )
+            )
+        except Exception:
+            return 0
+
+    def _install_toronto_network_recorder(self, page: Any) -> dict[str, Any]:
+        recorder: dict[str, Any] = {"responses": [], "download_urls": []}
+
+        def on_response(response: Any) -> None:
+            try:
+                headers = {k.lower(): v for k, v in (response.headers or {}).items()}
+                url = normalize_key(response.url)
+                if self._response_looks_like_download(url, headers):
+                    recorder.setdefault("download_urls", []).append(url)
+                recorder.setdefault("responses", []).append(response)
+            except Exception:
+                return
+
+        try:
+            page.on("response", on_response)
+        except Exception:
+            pass
+        return recorder
+
+    def _response_looks_like_download(self, url: str, headers: dict[str, str]) -> bool:
+        content_type = normalize_key(headers.get("content-type", "")).lower()
+        content_disposition = normalize_key(headers.get("content-disposition", "")).lower()
+        lowered_url = normalize_key(url).lower()
+        if "attachment" in content_disposition:
+            return True
+        if any(
+            token in content_type
+            for token in (
+                "application/pdf",
+                "application/octet-stream",
+                "application/zip",
+                "application/x-zip",
+                "application/msword",
+                "application/vnd.",
+            )
+        ):
+            return True
+        return bool(re.search(r"\.(pdf|zip|docx?|xlsx?)(?:\?|$)", lowered_url))
+
+    def _extract_network_document_data(self, recorder: dict[str, Any], base_url: str) -> tuple[dict[str, str], set[str]]:
+        links: dict[str, str] = {}
+        available: set[str] = set()
+
+        for response in recorder.get("responses", [])[:500]:
+            try:
+                url = normalize_key(response.url)
+                headers = {k.lower(): v for k, v in (response.headers or {}).items()}
+                request = getattr(response, "request", None)
+                resource_type = getattr(request, "resource_type", "") if request else ""
+            except Exception:
+                continue
+
+            lowered_url = url.lower()
+            content_type = normalize_key(headers.get("content-type", "")).lower()
+            relevant = (
+                resource_type in {"xhr", "fetch", "document"}
+                or "json" in content_type
+                or any(token in lowered_url for token in ("aic", "application", "document", "attachment", "file", "folder", "submission"))
+            )
+            if not relevant:
+                continue
+
+            # File responses are useful as direct URLs, but they usually do not identify
+            # which row they came from unless captured during a row click.
+            if self._response_looks_like_download(url, headers) and self._is_meaningful_document_url(url, base_url):
+                continue
+
+            try:
+                body_text = response.text()
+            except Exception:
+                body_text = ""
+            if not body_text or len(body_text) > 2_500_000:
+                continue
+
+            found_links, found_available = self._extract_document_data_from_text(body_text, url, base_url)
+            for name in found_available:
+                available.add(name)
+            for name, href in found_links.items():
+                if href and not links.get(name):
+                    links[name] = href
+
+        return links, available
+
+    def _extract_document_data_from_text(self, body_text: str, source_url: str, base_url: str) -> tuple[dict[str, str], set[str]]:
+        links: dict[str, str] = {}
+        available: set[str] = set()
+        text_sample = body_text[:2_500_000]
+
+        looks_like_document_table = bool(re.search(r"Reference\s+File|Supporting\s+Documentation|\bDownload\b", text_sample, re.I))
+        if looks_like_document_table:
+            for name, patterns in self.REQUIRED_DOCUMENTS.items():
+                if any(re.search(pattern, text_sample, flags=re.I) for pattern in patterns):
+                    available.add(name)
+
+        if "<" in text_sample and ("Download" in text_sample or "Reference File" in text_sample or "href" in text_sample):
+            try:
+                html_links = self._extract_document_links(text_sample, base_url)
+                for name, href in html_links.items():
+                    if href and self._is_meaningful_document_url(href, base_url):
+                        links[name] = href
+                        available.add(name)
+            except Exception:
+                pass
+
+        try:
+            data = json.loads(text_sample)
+        except Exception:
+            data = None
+
+        if data is not None:
+            self._walk_document_json(data, source_url, base_url, links, available)
+
+        return links, available
+
+    def _walk_document_json(
+        self,
+        obj: Any,
+        source_url: str,
+        base_url: str,
+        links: dict[str, str],
+        available: set[str],
+        depth: int = 0,
+    ) -> None:
+        if depth > 8:
+            return
+
+        if isinstance(obj, dict):
+            scalar_values: list[str] = []
+            for key, value in obj.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    scalar_values.append(f"{key}: {value}")
+            combined = normalize_key(" ".join(scalar_values))
+            doc_name = self._document_name_for_text(combined)
+            if doc_name:
+                available.add(doc_name)
+                for candidate in self._json_url_candidates(obj, source_url, base_url):
+                    if self._is_meaningful_document_url(candidate, base_url):
+                        links.setdefault(doc_name, candidate)
+                        break
+
+            for value in obj.values():
+                self._walk_document_json(value, source_url, base_url, links, available, depth + 1)
+            return
+
+        if isinstance(obj, list):
+            for value in obj[:300]:
+                self._walk_document_json(value, source_url, base_url, links, available, depth + 1)
+            return
+
+        if isinstance(obj, str):
+            doc_name = self._document_name_for_text(obj)
+            if doc_name:
+                available.add(doc_name)
+                if "<" in obj or "http" in obj or "/" in obj:
+                    found_links, found_available = self._extract_document_data_from_text(obj, source_url, base_url)
+                    available.update(found_available)
+                    for name, href in found_links.items():
+                        links.setdefault(name, href)
+
+    def _json_url_candidates(self, obj: dict[str, Any], source_url: str, base_url: str) -> list[str]:
+        candidates: list[str] = []
+
+        def add(value: Any) -> None:
+            raw = html.unescape(str(value or "")).strip()
+            if not raw:
+                return
+            pieces: list[str] = []
+            pieces.extend(re.findall(r"https?://[^\s'\"<>\\)]+", raw, flags=re.I))
+            pieces.extend(re.findall(r"(?<![A-Za-z0-9])(/[^\s'\"<>\\)]+)", raw))
+            if not pieces and re.search(r"\.(?:pdf|zip|docx?|xlsx?)(?:\?|$)|download|document|attachment|file", raw, re.I):
+                pieces.append(raw)
+            for piece in pieces:
+                full_url = urljoin(base_url or source_url, normalize_key(piece))
+                if full_url and full_url not in candidates:
+                    candidates.append(full_url)
+
+        for key, value in obj.items():
+            key_lower = str(key).lower()
+            if any(token in key_lower for token in ("url", "href", "link", "download", "document", "attachment", "file", "path")):
+                add(value)
+            elif isinstance(value, str) and re.search(r"https?://|/.*(?:download|document|attachment|file)|\.(?:pdf|zip|docx?|xlsx?)(?:\?|$)", value, re.I):
+                add(value)
+
+        return candidates
+
+    def _set_document_table_to_all_rows(self, scope: Any, search_term: str = "") -> None:
+        """Make the Supporting Documentation table expose matching rows in the DOM."""
+        scope.evaluate(
             """
             (searchTerm) => {
                 const terms = (searchTerm || '').trim();
+
+                const fire = (el, type) => el.dispatchEvent(new Event(type, { bubbles: true }));
 
                 if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
                     window.jQuery('table').each(function () {
                         try {
                             const dt = window.jQuery(this).DataTable();
-                            dt.search(terms);
-                            dt.page.len(100).draw(false);
+                            if (dt.search) dt.search(terms);
+                            if (dt.page && dt.page.len) dt.page.len(100).draw(false);
                         } catch (e) {}
                     });
                 }
@@ -884,31 +1203,43 @@ class TorontoOpenDataMonitor:
                     } catch (e) {}
                 }
 
-                for (const input of document.querySelectorAll('input[type="search"], input[aria-label*="Search" i]')) {
+                const searchInputs = Array.from(document.querySelectorAll(
+                    'input[type="search"], input[aria-label*="Search" i], input[placeholder*="Search" i]'
+                ));
+                for (const input of searchInputs) {
+                    input.focus();
                     input.value = terms;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('keyup', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    fire(input, 'input');
+                    fire(input, 'keyup');
+                    fire(input, 'change');
                 }
 
                 for (const sel of document.querySelectorAll('select')) {
                     const opts = Array.from(sel.options || []);
                     if (!opts.length) continue;
+                    const numeric = opts
+                        .map(o => ({ option: o, n: parseInt(o.value || o.textContent || '0', 10) }))
+                        .filter(x => !Number.isNaN(x.n));
                     const chosen =
                         opts.find(o => o.value === '-1') ||
                         opts.find(o => o.value === '100') ||
-                        opts.find(o => o.value === '50') ||
+                        opts.find(o => /100/.test(o.textContent || '')) ||
+                        (numeric.length ? numeric.sort((a, b) => b.n - a.n)[0].option : null) ||
                         opts[opts.length - 1];
                     if (chosen) {
                         sel.value = chosen.value;
-                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        fire(sel, 'input');
+                        fire(sel, 'change');
                     }
                 }
             }
             """,
             search_term,
         )
-        page.wait_for_timeout(800)
+        try:
+            scope.wait_for_timeout(1000)
+        except Exception:
+            pass
 
     def _row_url_candidates(self, row: Any, base_url: str) -> list[str]:
         try:
@@ -921,7 +1252,7 @@ class TorontoOpenDataMonitor:
                             values.push(String(value));
                         }
                     };
-                    const nodes = [row, ...row.querySelectorAll('a, button, input, [onclick], [data-href], [data-url], [data-download-url], [data-document-url], [data-file-url]')];
+                    const nodes = [row, ...row.querySelectorAll('a, button, input, [onclick], [href], [src], [formaction], [data-href], [data-url], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')];
                     for (const node of nodes) {
                         if (!node.getAttributeNames) continue;
                         for (const attr of node.getAttributeNames()) {
@@ -943,7 +1274,7 @@ class TorontoOpenDataMonitor:
             raw = html.unescape(str(value or "")).strip()
             if not raw:
                 continue
-            pieces = []
+            pieces: list[str] = []
             pieces.extend(re.findall(r"https?://[^\s'\"<>\\)]+", raw, flags=re.I))
             pieces.extend(re.findall(r"(?<![A-Za-z0-9])(/[^\s'\"<>\\)]+)", raw))
             pieces.extend(
@@ -955,33 +1286,29 @@ class TorontoOpenDataMonitor:
             )
             if not pieces:
                 lowered = raw.lower()
-                if (
-                    not lowered.startswith(("javascript:", "mailto:", "tel:", "#", "blob:"))
-                    and ("/" in raw or "download" in lowered or "document" in lowered or "file" in lowered)
+                if not lowered.startswith(("javascript:", "mailto:", "tel:", "#", "blob:")) and (
+                    "/" in raw or "download" in lowered or "document" in lowered or "file" in lowered or "attachment" in lowered
                 ):
                     pieces.append(raw)
             for piece in pieces:
-                piece = normalize_key(piece)
-                lowered_piece = piece.lower()
-                if not piece or lowered_piece.startswith(("javascript:", "mailto:", "tel:", "#", "blob:")):
-                    continue
-                full_url = urljoin(base_url, piece)
-                if full_url not in candidates:
+                full_url = urljoin(base_url, normalize_key(piece))
+                if self._is_meaningful_document_url(full_url, base_url) and full_url not in candidates:
                     candidates.append(full_url)
         return candidates
 
-    def _visible_document_rows(self, page: Any, required_name: str) -> list[Any]:
+    def _visible_document_rows(self, scope: Any, required_name: str) -> list[Any]:
         rows: list[Any] = []
+        selectors = "table tbody tr, table tr, [role='row']"
         try:
-            locator = page.locator("table tbody tr")
-            count = min(locator.count(), 200)
+            locator = scope.locator(selectors)
+            count = min(locator.count(), 300)
         except Exception:
             return rows
 
         for index in range(count):
             row = locator.nth(index)
             try:
-                text = normalize_key(row.inner_text(timeout=1000))
+                text = normalize_key(row.inner_text(timeout=1200))
             except Exception:
                 continue
             if not text or "no matching records" in text.lower():
@@ -990,20 +1317,39 @@ class TorontoOpenDataMonitor:
                 rows.append(row)
         return rows
 
+    def _document_names_visible_on_page(self, page: Any) -> set[str]:
+        names: set[str] = set()
+        for scope in self._document_scopes(page):
+            try:
+                texts = scope.evaluate(
+                    """
+                    () => Array.from(document.querySelectorAll('table tbody tr, table tr, [role="row"], li'))
+                        .map(el => el.innerText || el.textContent || '')
+                        .filter(Boolean)
+                        .slice(0, 500)
+                    """
+                )
+            except Exception:
+                texts = []
+            for text in texts or []:
+                name = self._document_name_for_text(text)
+                if name:
+                    names.add(name)
+        return names
+
     def _click_row_download_for_url(self, page: Any, row: Any, base_url: str, required_name: str) -> str:
         downloads: list[Any] = []
         popups: list[Any] = []
-        requests_seen: list[str] = []
-        responses_seen: list[str] = []
+        opened_urls: list[str] = []
+        response_candidates: list[str] = []
+        request_candidates: list[str] = []
 
         def useful_url(candidate: str | None) -> str:
             candidate = normalize_key(candidate)
             if not candidate:
                 return ""
-            lowered = candidate.lower()
-            if lowered.startswith(("blob:", "about:", "javascript:", "mailto:", "tel:")):
-                return ""
-            return urljoin(base_url, candidate)
+            full_url = urljoin(base_url, candidate)
+            return full_url if self._is_meaningful_document_url(full_url, base_url) else ""
 
         def on_download(download: Any) -> None:
             downloads.append(download)
@@ -1013,23 +1359,33 @@ class TorontoOpenDataMonitor:
 
         def on_request(request: Any) -> None:
             try:
-                request_url = request.url
+                request_url = normalize_key(request.url)
+                resource_type = normalize_key(getattr(request, "resource_type", "")).lower()
+                method = normalize_key(getattr(request, "method", "")).upper()
             except Exception:
                 return
+            if self._is_static_asset_url(request_url):
+                return
             lowered = request_url.lower()
-            if any(token in lowered for token in ("download", "document", "attachment", "file", "aic", "application")):
-                requests_seen.append(request_url)
+            if resource_type in {"xhr", "fetch", "document"} or method == "POST" or any(
+                token in lowered for token in ("download", "document", "attachment", "file", "aic", "application", "folder")
+            ):
+                request_candidates.append(request_url)
 
         def on_response(response: Any) -> None:
             try:
-                response_url = response.url
+                response_url = normalize_key(response.url)
                 headers = {k.lower(): v for k, v in (response.headers or {}).items()}
             except Exception:
                 return
+            if self._is_static_asset_url(response_url):
+                return
+            if self._response_looks_like_download(response_url, headers):
+                response_candidates.append(response_url)
+                return
             lowered = response_url.lower()
-            content_disposition = headers.get("content-disposition", "").lower()
-            if "attachment" in content_disposition or any(token in lowered for token in ("download", "document", "attachment", "file")):
-                responses_seen.append(response_url)
+            if any(token in lowered for token in ("download", "document", "attachment", "file")):
+                response_candidates.append(response_url)
 
         try:
             page.on("download", on_download)
@@ -1063,20 +1419,41 @@ class TorontoOpenDataMonitor:
             except Exception:
                 pass
 
-            control = row.locator("a:has-text('Download'), button:has-text('Download'), input[value*='Download']").first
+            control = row.locator("a:has-text('Download'), button:has-text('Download'), input[value*='Download' i]").first
             try:
                 if control.count() == 0:
                     control = row.locator("a, button, input[type='button'], input[type='submit'], [role='button']").first
             except Exception:
                 pass
 
+            clicked = False
             try:
-                control.click(timeout=5000, no_wait_after=True)
-            except Exception as exc:
-                LOGGER.info("Could not click %s document download button: %s", required_name, exc)
-                return ""
+                control.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
 
-            page.wait_for_timeout(2500)
+            try:
+                with page.expect_download(timeout=6000) as download_info:
+                    control.click(timeout=5000, no_wait_after=True, force=True)
+                    clicked = True
+                download = download_info.value
+                candidate = useful_url(getattr(download, "url", ""))
+                try:
+                    download.cancel()
+                except Exception:
+                    pass
+                if candidate:
+                    return candidate
+            except Exception:
+                if not clicked:
+                    try:
+                        control.click(timeout=5000, no_wait_after=True, force=True)
+                        clicked = True
+                    except Exception as exc:
+                        LOGGER.info("Could not click %s document download button: %s", required_name, exc)
+                        return ""
+
+            page.wait_for_timeout(3000)
 
             for download in reversed(downloads):
                 candidate = useful_url(getattr(download, "url", ""))
@@ -1101,10 +1478,10 @@ class TorontoOpenDataMonitor:
                     return candidate
 
             try:
-                opened = page.evaluate("window.__torontoCapturedOpens || []") or []
+                opened_urls = page.evaluate("window.__torontoCapturedOpens || []") or []
             except Exception:
-                opened = []
-            for candidate in reversed(opened):
+                opened_urls = []
+            for candidate in reversed(opened_urls):
                 candidate = useful_url(candidate)
                 if candidate:
                     return candidate
@@ -1118,14 +1495,20 @@ class TorontoOpenDataMonitor:
                     pass
                 return candidate
 
-            for candidate in reversed(responses_seen + requests_seen):
+            for candidate in reversed(response_candidates):
                 candidate = useful_url(candidate)
-                if not candidate or candidate == before_url:
-                    continue
-                lowered = candidate.lower()
-                if any(ext in lowered for ext in (".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff")):
-                    continue
-                return candidate
+                if candidate:
+                    return candidate
+
+            # Last click-level fallback: if the click produced exactly one non-static XHR/POST,
+            # return it. This catches city endpoints that stream a file without helpful headers.
+            unique_requests = []
+            for candidate in request_candidates:
+                candidate = useful_url(candidate)
+                if candidate and candidate not in unique_requests:
+                    unique_requests.append(candidate)
+            if len(unique_requests) == 1:
+                return unique_requests[0]
         finally:
             try:
                 page.remove_listener("download", on_download)
@@ -1137,42 +1520,46 @@ class TorontoOpenDataMonitor:
 
         return ""
 
-    def _capture_document_download_links(self, page: Any, base_url: str) -> dict[str, str]:
-        """Capture URLs hidden behind Toronto's JavaScript Download buttons.
-
-        The Supporting Documentation table can render the action as a plain
-        button, not as an ``<a href>``. In that case, static HTML extraction sees
-        the Reference File names but no document URLs. This method clicks only
-        the rows that match the required document types and records the download,
-        popup, navigation, or network URL triggered by the click.
-        """
+    def _capture_document_download_links(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
+        """Capture URLs hidden behind Toronto's JavaScript Download buttons."""
         captured: dict[str, str] = {}
+        available: set[str] = set()
         search_terms = {
-            "Application Form": ["Application Form"],
-            "Architectural Plans": ["Architectural Plans", "Architectural"],
-            "Civil and Utilities Plans": ["Civil and Utilities Plans", "Utilities", "Civil"],
-            "Geotechnical Study": ["Geotechnical Study", "Geotechnical"],
-            "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater"],
+            "Application Form": ["Application Form", "Application"],
+            "Architectural Plans": ["Architectural Plans", "Architectural", "Elevations", "Floor Plans"],
+            "Civil and Utilities Plans": ["Civil and Utilities Plans", "Utilities", "Civil", "Servicing", "Grading", "Stormwater"],
+            "Geotechnical Study": ["Geotechnical Study", "Geotechnical", "Geo-tech", "Soil"],
+            "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater", "Dewatering"],
         }
 
-        try:
-            self._set_document_table_to_all_rows(page)
-        except Exception as exc:
-            LOGGER.info("Could not expose all document rows before download capture for %s: %s", base_url, exc)
+        scopes = self._document_scopes(page)
+        for scope in scopes:
+            try:
+                self._set_document_table_to_all_rows(scope)
+            except Exception:
+                pass
 
         for required_name in self.REQUIRED_DOCUMENTS:
-            rows = self._visible_document_rows(page, required_name)
+            rows: list[Any] = []
+            for scope in scopes:
+                rows.extend(self._visible_document_rows(scope, required_name))
             if not rows:
                 for term in search_terms.get(required_name, [required_name]):
-                    try:
-                        self._set_document_table_to_all_rows(page, term)
-                    except Exception:
-                        continue
-                    rows = self._visible_document_rows(page, required_name)
+                    for scope in scopes:
+                        try:
+                            self._set_document_table_to_all_rows(scope, term)
+                        except Exception:
+                            continue
+                    rows = []
+                    for scope in scopes:
+                        rows.extend(self._visible_document_rows(scope, required_name))
                     if rows:
                         break
 
-            for row in rows[:2]:
+            if rows:
+                available.add(required_name)
+
+            for row in rows[:3]:
                 for candidate in self._row_url_candidates(row, base_url):
                     if candidate:
                         captured[required_name] = candidate
@@ -1185,16 +1572,19 @@ class TorontoOpenDataMonitor:
                     captured[required_name] = clicked_url
                     break
 
-            try:
-                self._set_document_table_to_all_rows(page)
-            except Exception:
-                pass
+            for scope in scopes:
+                try:
+                    self._set_document_table_to_all_rows(scope)
+                except Exception:
+                    pass
 
         if captured:
-            LOGGER.info("Captured %d Toronto document download link(s) for %s: %s", len(captured), base_url, ", ".join(sorted(captured)))
-        else:
-            LOGGER.info("No Toronto document download links captured for %s", base_url)
-        return captured
+            LOGGER.info("Captured %d Toronto direct document link(s) for %s: %s", len(captured), base_url, ", ".join(sorted(captured)))
+        if available:
+            LOGGER.info("Detected %d Toronto required document row(s) for %s: %s", len(available), base_url, ", ".join(sorted(available)))
+        if not captured and not available:
+            LOGGER.info("No Toronto Supporting Documentation rows or direct document links captured for %s", base_url)
+        return captured, available
 
     def _looks_expired(self, html_text: str) -> bool:
         page_text = BeautifulSoup(html_text or "", "html.parser").get_text(" ", strip=True).lower()
