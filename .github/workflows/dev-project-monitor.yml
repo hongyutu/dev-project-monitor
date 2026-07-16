@@ -2,7 +2,7 @@ name: Development Project Monitor
 
 on:
   schedule:
-    - cron: "0 9,16 * * *"
+    - cron: "17 9,16 * * *"
       timezone: "America/Toronto"
   workflow_dispatch:
     inputs:
