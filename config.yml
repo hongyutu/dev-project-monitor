@@ -37,7 +37,7 @@ ottawa:
 news:
   enabled: true
   max_posts_per_site: 50
-  lookback_days: 7
+  lookback_days: 1
   minimum_keyword_score: 2
   sites:
     - name: RENX
