@@ -750,11 +750,21 @@ class TorontoOpenDataMonitor:
                         except Exception:
                             continue
 
-                    # Some DataTables default to 1/10 entries. Switch to the largest option.
-                    try:
+                # Supporting Documentation uses DataTables and defaults to 10 rows.
+                # Show all / 100 rows so documents on pages 2 and 3 are present.
+                try:
                         page.evaluate(
                             """
                             () => {
+                            if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+                                window.jQuery('table').each(function () {
+                                    try {
+                                        const dt = window.jQuery(this).DataTable();
+                                        dt.page.len(100).draw(false);
+                                    } catch (e) {}
+                                });
+                            }
+
                             for (const sel of document.querySelectorAll('select')) {
                                 const opts = Array.from(sel.options || []);
                                 if (!opts.length) continue;
@@ -772,8 +782,8 @@ class TorontoOpenDataMonitor:
                             """
                         )
                         page.wait_for_timeout(1500)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        LOGGER.info("Could not switch document table to all/100 entries for %s: %s", url, exc)
 
                     # Scroll so lazy-rendered table content appears.
                     try:
@@ -782,8 +792,26 @@ class TorontoOpenDataMonitor:
                     except Exception:
                         pass
 
-                    html_text = page.content()
                     final_url = page.url
+                    html_text = page.content()
+
+                try:
+                    doc_row_count = page.evaluate(
+                        """
+                        () => Array.from(document.querySelectorAll('table tbody tr'))
+                            .filter(tr => (tr.innerText || '').includes('Download')).length
+                        """
+                    )
+                except Exception:
+                    doc_row_count = "unknown"
+
+                LOGGER.info("Rendered Toronto detail page length for %s: %s", final_url, len(html_text or ""))
+                LOGGER.info(
+                    "Supporting Documentation present for %s: %s; document rows: %s",
+                    final_url,
+                    "Supporting Documentation" in (html_text or ""),
+                    doc_row_count,
+                )
 
                     context.close()
                     browser.close()
@@ -823,17 +851,85 @@ class TorontoOpenDataMonitor:
                 if any(re.search(pattern, lowered, flags=re.I) for pattern in patterns):
                     docs[name] = full_url
 
-        # Normal anchors.
+        def element_context(element: Any) -> str:
+            pieces = [element.get_text(" ", strip=True)]
+            for parent_name in ("tr", "li"):
+                parent = element.find_parent(parent_name)
+                if parent:
+                    pieces.append(parent.get_text(" ", strip=True))
+                    break
+            return normalize_key(" ".join(dict.fromkeys(piece for piece in pieces if piece)))
+
+        def url_candidates(element: Any) -> list[str]:
+            candidates: list[str] = []
+
+            def add_from_text(value: Any, *, allow_raw: bool) -> None:
+                raw = html.unescape(str(value or "")).strip()
+                if not raw:
+                    return
+
+                found = False
+                for match in re.findall(r"https?://[^\s'\"<>\\)]+", raw, flags=re.I):
+                    candidates.append(match)
+                    found = True
+
+                for match in re.findall(r"(?<![A-Za-z0-9])(/[^\s'\"<>\\)]+)", raw):
+                    candidates.append(match)
+                    found = True
+
+                for match in re.findall(
+                    r"['\"]([^'\"]*(?:download|document|attachment|file)[^'\"]*)['\"]",
+                    raw,
+                    flags=re.I,
+                ):
+                    candidates.append(match)
+                    found = True
+
+                if allow_raw and not found:
+                    lowered = raw.lower()
+                    if not lowered.startswith(("javascript:", "mailto:", "tel:", "#")):
+                        if "/" in raw or "download" in lowered or "document" in lowered or "file" in lowered:
+                            candidates.append(raw)
+
+            nodes = [element]
+            try:
+                nodes.extend(element.find_all(True))
+            except Exception:
+                pass
+
+            for node in nodes:
+                for attr_name, attr_value in getattr(node, "attrs", {}).items():
+                    attr_lower = attr_name.lower()
+                    if attr_lower in {"href", "src"} or attr_lower.startswith("data"):
+                        add_from_text(attr_value, allow_raw=True)
+                    elif attr_lower == "onclick":
+                        add_from_text(attr_value, allow_raw=False)
+
+            seen: set[str] = set()
+            unique: list[str] = []
+            for candidate in candidates:
+                candidate = normalize_key(candidate)
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    unique.append(candidate)
+            return unique
+
+        # Prefer full table-row context. Toronto's Action button says "Download",
+        # while the real document name is in the Reference File column.
+        for row in soup.select("table tbody tr, table tr"):
+            row_text = element_context(row)
+            for href in url_candidates(row):
+                maybe_capture(row_text, href)
+        # Normal anchors. In the Supporting Documentation table, the anchor
+        # text may be generic; the document name/type is often in sibling cells.
         for link in soup.find_all("a", href=True):
-            maybe_capture(link.get_text(" ", strip=True), link.get("href"))
+            maybe_capture(element_context(link), link.get("href"))
 
-        # Table rows sometimes hold the link in onclick/data attributes.
-        for element in soup.find_all(True):
-            visible_text = normalize_key(element.get_text(" ", strip=True))
-            attrs_text = " ".join(str(v) for v in element.attrs.values())
-
-            for match in re.findall(r"https?://[^\s'\"<>]+", attrs_text):
-                maybe_capture(visible_text, html.unescape(match))
+        # Fallback for links/buttons outside a normal table row.
+        for element in soup.select("a[href], button, [onclick], [data-href], [data-url], [data-download-url], [data-file-url]"):
+            visible_text = element_context(element)
+            for href in url_candidates(element):
+                maybe_capture(visible_text, href)
 
             for attr_name, attr_value in element.attrs.items():
                 if attr_name.lower().startswith("data") or attr_name.lower() in {
@@ -1448,7 +1544,6 @@ class Notifier:
             f"Description: {p.get('description') or 'Not found'}",
             f"Land Owner: {self._format_party(p.get('land_owner'))}",
             f"Applicant: {self._format_party(p.get('applicant'))}",
-            f"URL: {p.get('detail_url') or p.get('raw_application_url') or 'Not found'}",
         ]
         lines.extend(self._format_document_links(p.get("document_links") or {}))
         return lines
