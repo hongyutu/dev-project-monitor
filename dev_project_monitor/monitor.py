@@ -384,6 +384,10 @@ class TorontoOpenDataMonitor:
 
             normalized_rows.append(item)
 
+        LOGGER.info(
+            "Toronto Open Data retained %d row(s) after filtering; grouping into application-level records",
+            len(normalized_rows),
+        )
         grouped = self._group_rows_by_application(normalized_rows)
         grouped.sort(
             key=lambda x: parse_dt(x.get("submitted_date") or x.get("last_updated"))
@@ -592,11 +596,21 @@ class TorontoOpenDataMonitor:
             groups.setdefault(self._application_group_key(row), []).append(row)
 
         applications: list[dict[str, Any]] = []
-        for group_key, group_rows in groups.items():
+        total_groups = len(groups)
+        for index, (group_key, group_rows) in enumerate(groups.items(), start=1):
             representative = self._choose_representative_row(group_rows)
             addresses = self._unique_sorted(row.get("address") for row in group_rows)
             csv_row_ids = self._unique_sorted(row.get("csv_row_id") for row in group_rows)
             file_numbers = self._unique_sorted(row.get("file_number") for row in group_rows)
+
+            if index == 1 or index == total_groups or index % 5 == 0:
+                LOGGER.info(
+                    "Toronto grouping progress: %d/%d application group(s) processed (%s; %d metadata row(s))",
+                    index,
+                    total_groups,
+                    representative.get("address") or representative.get("file_number") or group_key,
+                    len(group_rows),
+                )
 
             app = dict(representative)
             app.update(
@@ -2092,38 +2106,60 @@ class TorontoOpenDataMonitor:
         return self._parse_application_form_contacts(text)
 
     def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
+        """Extract owner/applicant text from the lower half of page 1 only."""
         text_parts: list[str] = []
         try:
             import fitz
 
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            max_pages = min(2, len(doc))
-            for page_index in range(max_pages):
-                page = doc[page_index]
-                text_parts.append(page.get_text("text"))
-                try:
-                    for widget in page.widgets() or []:
-                        field_name = normalize_key(getattr(widget, "field_name", ""))
-                        field_value = normalize_key(getattr(widget, "field_value", ""))
-                        if field_name or field_value:
-                            text_parts.append(f"{field_name}: {field_value}".strip(" :"))
-                except Exception:
-                    pass
+            if len(doc) < 1:
+                return ""
+
+            page = doc[0]
+            page_rect = page.rect
+            lower_half = fitz.Rect(
+                page_rect.x0,
+                page_rect.y0 + (page_rect.height * 0.5),
+                page_rect.x1,
+                page_rect.y1,
+            )
+
+            # Text extraction is clipped to the owner/applicant area. This avoids
+            # mixing in header/property/application metadata from the top half.
+            text_parts.append(page.get_text("text", clip=lower_half))
+
+            # Fillable PDFs expose values as widgets, not ordinary page text.
+            # Keep only widgets whose rectangle intersects the lower half.
+            try:
+                for widget in page.widgets() or []:
+                    rect = getattr(widget, "rect", None)
+                    if rect is not None:
+                        try:
+                            widget_rect = fitz.Rect(rect)
+                            if not widget_rect.intersects(lower_half):
+                                continue
+                        except Exception:
+                            pass
+
+                    field_name = normalize_key(getattr(widget, "field_name", ""))
+                    field_value = normalize_key(getattr(widget, "field_value", ""))
+                    if field_name or field_value:
+                        text_parts.append(f"{field_name}: {field_value}".strip(" :"))
+            except Exception:
+                pass
 
             if len("\n".join(text_parts).strip()) < 200 and self.config.get("ocr_image_pdfs", True):
                 try:
                     import pytesseract
                     from PIL import Image
 
-                    for page_index in range(max_pages):
-                        page = doc[page_index]
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                        image = Image.open(io.BytesIO(pix.tobytes("png")))
-                        text_parts.append(pytesseract.image_to_string(image))
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=lower_half)
+                    image = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text_parts.append(pytesseract.image_to_string(image))
                 except Exception as exc:
-                    LOGGER.info("OCR fallback unavailable for application form PDF: %s", exc)
+                    LOGGER.info("OCR fallback unavailable for lower-half application form PDF: %s", exc)
         except Exception as exc:
-            LOGGER.info("Could not parse application form PDF: %s", exc)
+            LOGGER.info("Could not parse application form PDF lower half: %s", exc)
 
         return "\n".join(part for part in text_parts if part)
 
@@ -2222,27 +2258,52 @@ class TorontoOpenDataMonitor:
         item.setdefault("land_owner", {"name": "", "phone": "", "email": "", "address": ""})
         item.setdefault("applicant", {"name": "", "phone": "", "email": "", "address": ""})
 
+        LOGGER.info(
+            "Toronto enrich start: %s (%s)",
+            item.get("file_number") or item.get("address") or "unknown application",
+            detail_url or raw_url or "no-url",
+        )
+
         if item["link_status"] != "current" or not detail_url:
+            LOGGER.info("Toronto enrich skipped: link_status=%s", item["link_status"])
             return item
 
         try:
+            LOGGER.info("Toronto render start: %s", detail_url)
             final_url, html_text = self._fetch_rendered_page(detail_url)
+            LOGGER.info("Toronto render complete: %s bytes=%d", final_url or detail_url, len(html_text or ""))
             if self._looks_expired(html_text):
                 item["link_status"] = "expired"
+                LOGGER.info("Toronto render indicated expired page: %s", final_url or detail_url)
                 return item
 
             item["detail_url"] = final_url or detail_url
             item["document_links"] = self._extract_document_links(html_text, item["detail_url"])
+            found_docs = sum(1 for value in item["document_links"].values() if normalize_key(value))
+            LOGGER.info(
+                "Toronto supporting docs extracted: %d/%d found for %s",
+                found_docs,
+                len(self.REQUIRED_DOCUMENTS),
+                item["detail_url"],
+            )
 
+            LOGGER.info("Toronto contact extraction: trying rendered HTML for %s", item["detail_url"])
             form_contacts = self._extract_application_form_contacts_from_rendered_html(html_text)
             if self._contacts_have_content(form_contacts):
                 item.update(form_contacts)
+                LOGGER.info("Toronto contact extraction succeeded from rendered HTML for %s", item["detail_url"])
             else:
                 form_url = item["document_links"].get("Application Form")
                 if form_url:
+                    LOGGER.info("Toronto contact extraction fallback: downloading Application Form for %s", item["detail_url"])
                     fallback_contacts = self._extract_application_form_contacts(form_url)
                     if self._contacts_have_content(fallback_contacts):
                         item.update(fallback_contacts)
+                        LOGGER.info("Toronto contact extraction succeeded from Application Form for %s", item["detail_url"])
+                    else:
+                        LOGGER.info("Toronto contact extraction found no owner/applicant data in Application Form for %s", item["detail_url"])
+                else:
+                    LOGGER.info("Toronto contact extraction skipped: Application Form link not found for %s", item["detail_url"])
         except Exception as exc:
             LOGGER.info("Could not enrich Toronto application page %s: %s", detail_url, exc)
 
@@ -2964,7 +3025,10 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
                 mark=not dry_run,
             )
 
-            for item in toronto_unseen:
+            LOGGER.info("Toronto enrichment queue: %d item(s) need detail-page processing", len(toronto_unseen))
+            for index, item in enumerate(toronto_unseen, start=1):
+                progress_label = item.title or item.payload.get("file_number") or item.payload.get("address") or "Toronto application"
+                LOGGER.info("Toronto enrichment progress %d/%d: %s", index, len(toronto_unseen), progress_label)
                 enriched_payload = toronto_monitor.enrich_application(item.payload)
                 ready_items.append(
                     dataclasses.replace(
@@ -2974,6 +3038,15 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
                         or item.url,
                         payload=enriched_payload,
                     )
+                )
+                LOGGER.info(
+                    "Toronto enrichment finished %d/%d: %s; documents=%d; owner=%s; applicant=%s",
+                    index,
+                    len(toronto_unseen),
+                    progress_label,
+                    sum(1 for value in enriched_payload.get("document_links", {}).values() if normalize_key(value)),
+                    "yes" if any(normalize_key(v) for v in (enriched_payload.get("land_owner") or {}).values()) else "no",
+                    "yes" if any(normalize_key(v) for v in (enriched_payload.get("applicant") or {}).values()) else "no",
                 )
 
             LOGGER.info(
