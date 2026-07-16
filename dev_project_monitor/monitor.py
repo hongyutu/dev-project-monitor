@@ -19,6 +19,7 @@ import re
 import smtplib
 import sqlite3
 import sys
+import tempfile
 import textwrap
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
@@ -56,6 +57,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "page_timeout_ms": 60000,
         "post_load_wait_ms": 2500,
         "ocr_image_pdfs": True,
+        "extract_application_form_contacts": True,
+        "application_form_download_timeout_ms": 12000,
         "lookback_days": 45,
         "application_types": [],
     },
@@ -821,6 +824,15 @@ class TorontoOpenDataMonitor:
             return ""
         return "\n<div id=\"captured-toronto-document-links\"><table><tbody>" + "".join(rows) + "</tbody></table></div>\n"
 
+    def _application_form_text_fixture_html(self, text: str) -> str:
+        text = str(text or "")
+        if not normalize_key(text):
+            return ""
+        return (
+            "\n<div id=\"captured-toronto-application-form-text\" data-captured=\"true\">"
+            "<pre>" + html.escape(text) + "</pre></div>\n"
+        )
+
     def _fetch_rendered_page(self, url: str) -> tuple[str, str]:
         """Render Toronto application page and expand/capture Supporting Documentation."""
         if self.config.get("render_with_playwright", True):
@@ -844,8 +856,11 @@ class TorontoOpenDataMonitor:
                             timeout=int(self.config.get("page_timeout_ms", 60000)),
                         )
 
+                        # Do not wait a long time for networkidle. The Toronto page can keep
+                        # analytics/API requests open, and this monitor only needs the rendered
+                        # Supporting Documentation table.
                         try:
-                            page.wait_for_load_state("networkidle", timeout=30000)
+                            page.wait_for_load_state("networkidle", timeout=8000)
                         except Exception:
                             pass
 
@@ -880,13 +895,26 @@ class TorontoOpenDataMonitor:
 
                         final_url = page.url
                         network_links, network_available = self._extract_network_document_data(network_recorder, final_url)
-                        captured_links, clicked_available = self._capture_document_download_links(page, final_url)
+                        button_links, button_available = self._extract_download_button_document_rows(page, final_url)
 
+                        # Fast path: do not click Download buttons. Toronto exposes the
+                        # important row identity as button.downloadFile[data-id]. Clicking
+                        # each button can trigger browser downloads and several-second
+                        # waits per document per application, which makes scheduled runs
+                        # unacceptably slow. Prefer real network URLs seen during page
+                        # load, then fall back to stable row-specific data-id URLs.
                         document_links = dict(network_links)
-                        document_links.update({k: v for k, v in captured_links.items() if v})
+                        for name, href in button_links.items():
+                            if href and not document_links.get(name):
+                                document_links[name] = href
 
                         visible_available = self._document_names_visible_on_page(page)
-                        available_names = set(network_available) | set(clicked_available) | set(visible_available) | set(document_links)
+                        available_names = (
+                            set(network_available)
+                            | set(button_available)
+                            | set(visible_available)
+                            | set(document_links)
+                        )
 
                         html_text = self._combined_page_content(page)
                         html_text += self._download_links_fixture_html(document_links, available_names, final_url)
@@ -896,13 +924,20 @@ class TorontoOpenDataMonitor:
                         except Exception:
                             doc_row_count = "unknown"
 
+                        application_form_text = ""
+                        if self.config.get("extract_application_form_contacts", True) and "Application Form" in available_names:
+                            application_form_text = self._extract_application_form_text_from_page(page, final_url)
+                            if application_form_text:
+                                html_text += self._application_form_text_fixture_html(application_form_text)
+
                         LOGGER.info("Rendered Toronto detail page length for %s: %s", final_url, len(html_text or ""))
                         LOGGER.info(
-                            "Supporting Documentation for %s: rows=%s; direct_links=%s; available_rows=%s; names=%s",
+                            "Supporting Documentation for %s: rows=%s; direct_links=%s; available_rows=%s; application_form_text=%s; names=%s",
                             final_url,
                             doc_row_count,
                             len(document_links),
                             len(available_names),
+                            bool(normalize_key(application_form_text)),
                             ", ".join(sorted(available_names)) or "none",
                         )
 
@@ -1067,6 +1102,202 @@ class TorontoOpenDataMonitor:
             for name, href in found_links.items():
                 if href and not links.get(name):
                     links[name] = href
+
+        return links, available
+
+    def _download_button_fallback_url(self, base_url: str, document_name: str, data_id: str = "") -> str:
+        """Return a stable URL for a Toronto Supporting Documentation row.
+
+        The Toronto page renders document rows as DataTables rows with a
+        button.downloadFile[data-id] control. The data-id is a JavaScript token,
+        not an href. When the real download URL is not exposed by the network
+        layer, this URL still opens the correct application details page and
+        carries the document/data-id in the fragment for debugging and manual
+        lookup.
+        """
+        base = normalize_key(base_url).split("#", 1)[0]
+        if not base:
+            return ""
+        fragment_parts = ["supporting-documentation"]
+        if document_name:
+            fragment_parts.append("document=" + quote_plus(normalize_key(document_name)))
+        if data_id:
+            fragment_parts.append("data-id=" + quote_plus(normalize_key(data_id)))
+        return base + "#" + "&".join(fragment_parts)
+
+    def _extract_download_button_document_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
+        """Extract document rows from DataTables, including hidden/paginated rows.
+
+        Toronto's Supporting Documentation table stores the document name in the
+        first cell and the action in the fourth cell as:
+
+            <button class="downloadFile" data-id="...">Download</button>
+
+        DataTables often keeps only the current 10 DOM rows visible. Reading the
+        DataTables API gives all rows, including rows on later pages and rows
+        found through the table search box.
+        """
+        links: dict[str, str] = {}
+        available: set[str] = set()
+        rows_seen = 0
+
+        js = r"""
+        () => {
+            const out = [];
+            const seen = new Set();
+
+            const textFromHtml = (value) => {
+                const raw = String(value ?? '');
+                const div = document.createElement('div');
+                div.innerHTML = raw;
+                return (div.innerText || div.textContent || raw).replace(/\s+/g, ' ').trim();
+            };
+
+            const attrsFromHtml = (value) => {
+                const raw = String(value ?? '');
+                const attrs = [];
+                const div = document.createElement('div');
+                div.innerHTML = raw;
+                for (const node of div.querySelectorAll('a, button, input, [href], [src], [onclick], [data-id], [data-url], [data-href], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')) {
+                    const rec = {};
+                    if (!node.getAttributeNames) continue;
+                    for (const attr of node.getAttributeNames()) {
+                        const lower = attr.toLowerCase();
+                        if (['href', 'src', 'formaction', 'onclick'].includes(lower) || lower.startsWith('data')) {
+                            rec[lower] = node.getAttribute(attr);
+                        }
+                    }
+                    const cls = node.getAttribute('class');
+                    if (cls) rec.class = cls;
+                    if (Object.keys(rec).length) attrs.push(rec);
+                }
+
+                // Be tolerant of escaped HTML strings returned by DataTables.
+                for (const match of raw.matchAll(/data-id\s*=\s*["']([^"']+)["']/gi)) {
+                    attrs.push({'data-id': match[1], class: 'downloadFile'});
+                }
+                for (const match of raw.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
+                    attrs.push({href: match[1]});
+                }
+                return attrs;
+            };
+
+            const attrsFromNode = (root) => {
+                const attrs = [];
+                const nodes = [root, ...root.querySelectorAll('a, button, input, [href], [src], [onclick], [data-id], [data-url], [data-href], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')];
+                for (const node of nodes) {
+                    if (!node || !node.getAttributeNames) continue;
+                    const rec = {};
+                    for (const attr of node.getAttributeNames()) {
+                        const lower = attr.toLowerCase();
+                        if (['href', 'src', 'formaction', 'onclick'].includes(lower) || lower.startsWith('data')) {
+                            rec[lower] = node.getAttribute(attr);
+                        }
+                    }
+                    const cls = node.getAttribute('class');
+                    if (cls) rec.class = cls;
+                    if (Object.keys(rec).length) attrs.push(rec);
+                }
+                return attrs;
+            };
+
+            const addRow = (source, cells, attrs) => {
+                const safeCells = (cells || []).map(v => String(v ?? ''));
+                const text = safeCells.map(textFromHtml).join(' ').replace(/\s+/g, ' ').trim();
+                const html = safeCells.join(' ');
+                const dataIds = [];
+                const hrefs = [];
+                const onclicks = [];
+
+                for (const rec of attrs || []) {
+                    for (const [key, value] of Object.entries(rec)) {
+                        const lower = String(key).toLowerCase();
+                        const val = String(value ?? '').trim();
+                        if (!val) continue;
+                        if (lower === 'href' || lower === 'src' || lower === 'formaction' || lower.includes('url') || lower.includes('href')) hrefs.push(val);
+                        if (lower === 'onclick') onclicks.push(val);
+                        if (lower === 'data-id' || lower.endsWith('-id') || lower === 'id') dataIds.push(val);
+                    }
+                }
+
+                if (!text && !html && !dataIds.length && !hrefs.length) return;
+                const key = [source, text, dataIds.join('|'), hrefs.join('|')].join('||');
+                if (seen.has(key)) return;
+                seen.add(key);
+                out.push({source, text, html, data_ids: dataIds, hrefs, onclicks});
+            };
+
+            const tables = Array.from(document.querySelectorAll('table'));
+
+            if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+                for (const table of tables) {
+                    try {
+                        if (window.jQuery.fn.dataTable.isDataTable && !window.jQuery.fn.dataTable.isDataTable(table)) continue;
+                        const dt = window.jQuery(table).DataTable();
+                        const data = dt.rows().data().toArray();
+                        for (const row of data.slice(0, 1000)) {
+                            let cells = [];
+                            if (Array.isArray(row)) cells = row;
+                            else if (row && typeof row === 'object') cells = Object.values(row);
+                            else cells = [row];
+                            const attrs = [];
+                            for (const cell of cells) attrs.push(...attrsFromHtml(cell));
+                            addRow('datatable', cells, attrs);
+                        }
+                    } catch (e) {}
+                }
+            }
+
+            // DOM fallback for the currently visible page of the table.
+            for (const tr of document.querySelectorAll('table tbody tr, table tr')) {
+                const cells = Array.from(tr.children || []).map(td => td.innerHTML || td.textContent || '');
+                addRow('dom', cells.length ? cells : [tr.innerHTML || tr.textContent || ''], attrsFromNode(tr));
+            }
+
+            return out.slice(0, 1200);
+        }
+        """
+
+        for scope in self._document_scopes(page):
+            try:
+                raw_rows = scope.evaluate(js) or []
+            except Exception as exc:
+                LOGGER.info("Could not inspect Toronto DataTables document rows for %s: %s", base_url, exc)
+                raw_rows = []
+
+            for row in raw_rows:
+                rows_seen += 1
+                text = normalize_key((row or {}).get("text") or (row or {}).get("html"))
+                if not text or "no matching records" in text.lower():
+                    continue
+
+                document_name = self._document_name_for_text(text)
+                if not document_name:
+                    continue
+                available.add(document_name)
+
+                for href in (row or {}).get("hrefs") or []:
+                    full_url = urljoin(base_url, normalize_key(href))
+                    if self._is_meaningful_document_url(full_url, base_url):
+                        links.setdefault(document_name, full_url)
+                        break
+
+                if not links.get(document_name):
+                    data_ids = [normalize_key(value) for value in ((row or {}).get("data_ids") or []) if normalize_key(value)]
+                    # Prefer tokens attached to the visible Download button. Ignore generic table IDs.
+                    if data_ids:
+                        links.setdefault(document_name, self._download_button_fallback_url(base_url, document_name, data_ids[0]))
+
+        if available:
+            LOGGER.info(
+                "Detected Toronto document button rows for %s: rows_inspected=%s; required=%s; token_links=%s",
+                base_url,
+                rows_seen,
+                ", ".join(sorted(available)),
+                ", ".join(sorted(links)) or "none",
+            )
+        else:
+            LOGGER.info("No required Toronto document button rows detected for %s after inspecting %s row(s)", base_url, rows_seen)
 
         return links, available
 
@@ -1586,6 +1817,122 @@ class TorontoOpenDataMonitor:
             LOGGER.info("No Toronto Supporting Documentation rows or direct document links captured for %s", base_url)
         return captured, available
 
+    def _extract_application_form_text_from_page(self, page: Any, base_url: str) -> str:
+        """Click only the Application Form download button and extract its text.
+
+        Other document rows are detected from DataTables/data-id tokens without
+        clicking. The Application Form is the one exception because owner and
+        applicant fields live inside the PDF/form itself.
+        """
+        timeout_ms = int(self.config.get("application_form_download_timeout_ms", 12000) or 12000)
+        scopes = self._document_scopes(page)
+        rows: list[Any] = []
+
+        for scope in scopes:
+            try:
+                self._set_document_table_to_all_rows(scope)
+            except Exception:
+                pass
+        for scope in scopes:
+            rows.extend(self._visible_document_rows(scope, "Application Form"))
+
+        if not rows:
+            for term in ("Application Form", "Application"):
+                for scope in scopes:
+                    try:
+                        self._set_document_table_to_all_rows(scope, term)
+                    except Exception:
+                        pass
+                rows = []
+                for scope in scopes:
+                    rows.extend(self._visible_document_rows(scope, "Application Form"))
+                if rows:
+                    break
+
+        if not rows:
+            LOGGER.info("Application Form row not visible for %s; contact extraction skipped", base_url)
+            return ""
+
+        for row in rows[:2]:
+            try:
+                control = row.locator("button.downloadFile, a:has-text('Download'), button:has-text('Download'), input[value*='Download' i]").first
+                try:
+                    if control.count() == 0:
+                        control = row.locator("a, button, input[type='button'], input[type='submit'], [role='button']").first
+                except Exception:
+                    pass
+
+                try:
+                    control.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+
+                with page.expect_download(timeout=timeout_ms) as download_info:
+                    control.click(timeout=5000, no_wait_after=True, force=True)
+                download = download_info.value
+
+                file_bytes = self._read_playwright_download_bytes(download)
+                suggested_name = normalize_key(getattr(download, "suggested_filename", ""))
+                try:
+                    download.delete()
+                except Exception:
+                    pass
+
+                text = self._extract_application_form_text_from_bytes(file_bytes, suggested_name)
+                if normalize_key(text):
+                    LOGGER.info(
+                        "Downloaded Toronto Application Form for %s; filename=%s; extracted_chars=%s",
+                        base_url,
+                        suggested_name or "unknown",
+                        len(text),
+                    )
+                    return text
+            except Exception as exc:
+                LOGGER.info("Could not download/parse Toronto Application Form for %s: %s", base_url, exc)
+                continue
+
+        return ""
+
+    def _read_playwright_download_bytes(self, download: Any) -> bytes:
+        try:
+            path = download.path()
+            if path and os.path.exists(path):
+                with open(path, "rb") as fh:
+                    return fh.read()
+        except Exception:
+            pass
+
+        tmp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+            download.save_as(tmp_path)
+            with open(tmp_path, "rb") as fh:
+                return fh.read()
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        return b""
+
+    def _extract_application_form_text_from_bytes(self, file_bytes: bytes, filename: str = "") -> str:
+        if not file_bytes:
+            return ""
+        lowered_name = normalize_key(filename).lower()
+        if file_bytes[:5] == b"%PDF-" or lowered_name.endswith(".pdf"):
+            return self._extract_pdf_text(file_bytes)
+
+        try:
+            text = file_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            text = file_bytes.decode("latin-1", errors="replace")
+
+        if "<" in text[:5000] and re.search(r"<html|<body|<div|<span|<table", text[:5000], flags=re.I):
+            return BeautifulSoup(text, "html.parser").get_text("\n", strip=True)
+        return text
+
     def _looks_expired(self, html_text: str) -> bool:
         page_text = BeautifulSoup(html_text or "", "html.parser").get_text(" ", strip=True).lower()
         return any(marker in page_text for marker in ("page not found", "404", "access denied", "forbidden"))
@@ -1659,6 +2006,12 @@ class TorontoOpenDataMonitor:
             for node in nodes:
                 for attr_name, attr_value in getattr(node, "attrs", {}).items():
                     attr_lower = attr_name.lower()
+                    if attr_lower == "data-id":
+                        classes = " ".join(getattr(node, "get", lambda *_: "")("class", []) or [])
+                        context_text = element_context(element)
+                        doc_name = self._document_name_for_text(context_text)
+                        if doc_name and "downloadFile".lower() in classes.lower():
+                            candidates.append(self._download_button_fallback_url(base_url, doc_name, str(attr_value)))
                     if attr_lower in {"href", "src"} or attr_lower.startswith("data"):
                         add_from_text(attr_value, allow_raw=True)
                     elif attr_lower == "onclick":
@@ -1692,11 +2045,35 @@ class TorontoOpenDataMonitor:
 
         return docs
 
-    def _extract_application_form_contacts(self, application_form_url: str | None) -> dict[str, dict[str, str]]:
-        contacts = {
+    def _empty_party_contacts(self) -> dict[str, dict[str, str]]:
+        return {
             "land_owner": {"name": "", "phone": "", "email": "", "address": ""},
             "applicant": {"name": "", "phone": "", "email": "", "address": ""},
         }
+
+    def _contacts_have_content(self, contacts: dict[str, dict[str, str]] | None) -> bool:
+        if not isinstance(contacts, dict):
+            return False
+        for party in ("land_owner", "applicant"):
+            values = contacts.get(party) if isinstance(contacts.get(party), dict) else {}
+            if any(normalize_key(value) for value in values.values()):
+                return True
+        return False
+
+    def _extract_application_form_contacts_from_rendered_html(self, html_text: str) -> dict[str, dict[str, str]]:
+        contacts = self._empty_party_contacts()
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        node = soup.find(id="captured-toronto-application-form-text")
+        if not node:
+            return contacts
+        text = node.get_text("\n", strip=True)
+        if not normalize_key(text):
+            return contacts
+        parsed = self._parse_application_form_contacts(text)
+        return parsed if self._contacts_have_content(parsed) else contacts
+
+    def _extract_application_form_contacts(self, application_form_url: str | None) -> dict[str, dict[str, str]]:
+        contacts = self._empty_party_contacts()
         if not application_form_url:
             return contacts
 
@@ -1724,6 +2101,14 @@ class TorontoOpenDataMonitor:
             for page_index in range(max_pages):
                 page = doc[page_index]
                 text_parts.append(page.get_text("text"))
+                try:
+                    for widget in page.widgets() or []:
+                        field_name = normalize_key(getattr(widget, "field_name", ""))
+                        field_value = normalize_key(getattr(widget, "field_value", ""))
+                        if field_name or field_value:
+                            text_parts.append(f"{field_name}: {field_value}".strip(" :"))
+                except Exception:
+                    pass
 
             if len("\n".join(text_parts).strip()) < 200 and self.config.get("ocr_image_pdfs", True):
                 try:
@@ -1848,9 +2233,16 @@ class TorontoOpenDataMonitor:
 
             item["detail_url"] = final_url or detail_url
             item["document_links"] = self._extract_document_links(html_text, item["detail_url"])
-            form_url = item["document_links"].get("Application Form")
-            if form_url:
-                item.update(self._extract_application_form_contacts(form_url))
+
+            form_contacts = self._extract_application_form_contacts_from_rendered_html(html_text)
+            if self._contacts_have_content(form_contacts):
+                item.update(form_contacts)
+            else:
+                form_url = item["document_links"].get("Application Form")
+                if form_url:
+                    fallback_contacts = self._extract_application_form_contacts(form_url)
+                    if self._contacts_have_content(fallback_contacts):
+                        item.update(fallback_contacts)
         except Exception as exc:
             LOGGER.info("Could not enrich Toronto application page %s: %s", detail_url, exc)
 
@@ -2549,14 +2941,46 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
     store = StateStore(config["state_db"])
     candidate_items: list[NotificationItem] = []
 
+    ready_items: list[NotificationItem] = []
+
     if config.get("toronto", {}).get("enabled", True):
         LOGGER.info("Checking Toronto Open Data development applications")
         try:
             toronto_monitor = TorontoOpenDataMonitor(http, config["toronto"])
             apps = toronto_monitor.fetch_new_candidates()
-            enriched_apps = [toronto_monitor.enrich_application(app) for app in apps]
-            candidate_items.extend(to_notification_items_from_toronto(enriched_apps))
-            LOGGER.info("Toronto Open Data yielded %d candidate application(s)", len(enriched_apps))
+            toronto_items = to_notification_items_from_toronto(apps)
+
+            # Performance-critical: do not render/enrich every recent Toronto
+            # candidate on every run. Rendering the JavaScript application page
+            # is expensive, and most candidates have already been seen. Filter
+            # against SQLite first, then enrich only items that will actually be
+            # considered for notification. On first run with notify_on_first_run
+            # disabled, this marks candidates seen without opening hundreds of
+            # detail pages.
+            toronto_unseen = filter_unseen(
+                store,
+                toronto_items,
+                bool(config.get("notify_on_first_run", False)),
+                mark=not dry_run,
+            )
+
+            for item in toronto_unseen:
+                enriched_payload = toronto_monitor.enrich_application(item.payload)
+                ready_items.append(
+                    dataclasses.replace(
+                        item,
+                        url=enriched_payload.get("detail_url")
+                        or enriched_payload.get("raw_application_url")
+                        or item.url,
+                        payload=enriched_payload,
+                    )
+                )
+
+            LOGGER.info(
+                "Toronto Open Data yielded %d candidate application(s); %d new item(s) required enrichment",
+                len(apps),
+                len(toronto_unseen),
+            )
         except Exception as exc:
             LOGGER.exception("Toronto Open Data check failed: %s", exc)
 
@@ -2580,8 +3004,17 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
         except Exception as exc:
             LOGGER.exception("News check failed: %s", exc)
 
-    LOGGER.info("All sources yielded %d candidate item(s): %s", len(candidate_items), summarize_sources(candidate_items))
-    unseen = filter_unseen(store, candidate_items, bool(config.get("notify_on_first_run", False)), mark=not dry_run)
+    LOGGER.info(
+        "All unfiltered sources yielded %d candidate item(s): %s",
+        len(candidate_items),
+        summarize_sources(candidate_items),
+    )
+    unseen = ready_items + filter_unseen(
+        store,
+        candidate_items,
+        bool(config.get("notify_on_first_run", False)),
+        mark=not dry_run,
+    )
     LOGGER.info("After state filtering, %d new item(s) remain for notification: %s", len(unseen), summarize_sources(unseen))
     Notifier(config, dry_run=dry_run).send(unseen)
     return 0
