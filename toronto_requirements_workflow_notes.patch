@@ -1,0 +1,10 @@
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -3,3 +3,7 @@
+ PyYAML>=6.0
+ requests>=2.32
+ python-dateutil>=2.9
++playwright>=1.45
++pymupdf>=1.24
++pytesseract>=0.3
++Pillow>=10.0
