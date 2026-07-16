@@ -793,10 +793,17 @@ class TorontoOpenDataMonitor:
 
         base_no_hash = normalize_key(base_url).split("#", 1)[0]
         full_no_hash = full_url.split("#", 1)[0]
+        parsed = urlparse(full_url)
         if base_no_hash and full_no_hash == base_no_hash:
+            # A Toronto download button exposes only button.downloadFile[data-id].
+            # When the real file URL is hidden behind JavaScript, the monitor
+            # emits a same-page fragment that carries the document name and
+            # data-id token. Treat that as meaningful instead of discarding it.
+            fragment = normalize_key(parsed.fragment).lower()
+            if "supporting-documentation" in fragment and ("data-id=" in fragment or "document=" in fragment):
+                return True
             return False
 
-        parsed = urlparse(full_url)
         if "/application-details/" in parsed.path and not re.search(r"download|document|attachment|file", parsed.query, re.I):
             return False
 
@@ -911,12 +918,46 @@ class TorontoOpenDataMonitor:
                         network_links, network_available = self._extract_network_document_data(network_recorder, final_url)
                         button_links, button_available = self._extract_download_button_document_rows(page, final_url)
 
-                        # Fast path: do not click Download buttons. Toronto exposes the
-                        # important row identity as button.downloadFile[data-id]. Clicking
-                        # each button can trigger browser downloads and several-second
-                        # waits per document per application, which makes scheduled runs
-                        # unacceptably slow. Prefer real network URLs seen during page
-                        # load, then fall back to stable row-specific data-id URLs.
+                        # If DataTables is server-side or still paginating, use its own
+                        # search box for each standardized file name. This is still fast:
+                        # it does not click downloads; it only inspects first-td +
+                        # button.downloadFile[data-id] rows after each search.
+                        missing_button_names = [name for name in self.REQUIRED_DOCUMENTS if name not in button_available]
+                        if missing_button_names:
+                            search_terms = {
+                                "Application Form": ["Application Form"],
+                                "Architectural Plans": ["Architectural Plans", "Architectural"],
+                                "Civil and Utilities Plans": ["Civil and Utilities Plans", "Civil", "Utilities", "Servicing"],
+                                "Geotechnical Study": ["Geotechnical Study", "Geotechnical"],
+                                "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology"],
+                            }
+                            for required_name in missing_button_names:
+                                if required_name in button_available:
+                                    continue
+                                for term in search_terms.get(required_name, [required_name]):
+                                    for scope in self._document_scopes(page):
+                                        try:
+                                            self._set_document_table_to_all_rows(scope, term)
+                                        except Exception:
+                                            pass
+                                    more_links, more_available = self._extract_download_button_document_rows(page, final_url)
+                                    for name in more_available:
+                                        button_available.add(name)
+                                    for name, href in more_links.items():
+                                        if href and not button_links.get(name):
+                                            button_links[name] = href
+                                    if required_name in button_available:
+                                        break
+
+                            for scope in self._document_scopes(page):
+                                try:
+                                    self._set_document_table_to_all_rows(scope)
+                                except Exception:
+                                    pass
+
+                        # Fast path: do not click Download buttons except later for the
+                        # Application Form contact PDF. Toronto exposes document identity
+                        # as button.downloadFile[data-id], so prefer exact row-token links.
                         document_links = dict(network_links)
                         for name, href in button_links.items():
                             if href and not document_links.get(name):
@@ -990,33 +1031,76 @@ class TorontoOpenDataMonitor:
         return "\n".join(parts)
 
     def _expand_supporting_documentation(self, page: Any) -> None:
-        labels = (
-            r"Expand\s+All",
-            r"Supporting\s+Documentation",
-            r"Supporting\s+Documents",
-            r"Reference\s+File",
-        )
-        for scope in self._document_scopes(page):
-            for label_pattern in labels:
-                pattern = re.compile(label_pattern, re.I)
-                for locator_getter in (
-                    lambda: scope.get_by_role("button", name=pattern),
-                    lambda: scope.get_by_role("link", name=pattern),
-                    lambda: scope.get_by_text(pattern),
-                ):
-                    try:
-                        matches = locator_getter()
-                        count = min(matches.count(), 8)
-                    except Exception:
-                        continue
-                    for i in range(count):
-                        try:
-                            matches.nth(i).click(timeout=3000, no_wait_after=True)
-                            page.wait_for_timeout(700)
-                        except Exception:
-                            continue
+        """Open the Supporting Documentation accordion without toggling it closed.
 
-        # Give the table a chance to render after expansion.
+        Earlier versions clicked every text match for "Supporting Documentation",
+        which could expand and then immediately collapse the section. This version
+        checks for document rows after each action and only clicks a small number
+        of likely collapsed controls.
+        """
+        def count_rows() -> int:
+            try:
+                return sum(self._document_row_count(scope) for scope in self._document_scopes(page))
+            except Exception:
+                return 0
+
+        if count_rows() > 0:
+            return
+
+        click_js = r"""
+        (mode) => {
+            const visible = (el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+            const controls = Array.from(document.querySelectorAll('button, a, [role="button"], summary, h2, h3, h4, .accordion-header, .accordion-button'));
+            const candidates = [];
+            for (const el of controls) {
+                if (!visible(el)) continue;
+                const text = textOf(el);
+                if (!text) continue;
+                const isExpandAll = /expand\s+all/i.test(text);
+                const isSupporting = /supporting\s+doc/i.test(text);
+                if (mode === 'expandAll' && isExpandAll) candidates.push(el);
+                if (mode === 'supporting' && isSupporting) {
+                    const expanded = (el.getAttribute('aria-expanded') || '').toLowerCase();
+                    const cls = el.className ? String(el.className).toLowerCase() : '';
+                    // Click if it explicitly says collapsed/false, or if no state
+                    // is exposed and we still have no rows.
+                    if (expanded !== 'true' || /collapsed/.test(cls)) candidates.push(el);
+                }
+            }
+            let clicked = 0;
+            for (const el of candidates.slice(0, mode === 'expandAll' ? 2 : 3)) {
+                try {
+                    el.scrollIntoView({block: 'center', inline: 'center'});
+                    el.click();
+                    clicked++;
+                } catch (e) {}
+            }
+            return clicked;
+        }
+        """
+
+        for mode in ("expandAll", "supporting"):
+            clicked_total = 0
+            for scope in self._document_scopes(page):
+                try:
+                    clicked_total += int(scope.evaluate(click_js, mode) or 0)
+                except Exception:
+                    continue
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+            rows = count_rows()
+            LOGGER.info("Toronto Supporting Documentation expand step %s: clicked=%s rows=%s", mode, clicked_total, rows)
+            if rows > 0:
+                return
+
+        # Final short wait for late-rendered Angular/DataTables content.
         try:
             page.wait_for_timeout(1500)
         except Exception:
@@ -1140,135 +1224,158 @@ class TorontoOpenDataMonitor:
         return base + "#" + "&".join(fragment_parts)
 
     def _extract_download_button_document_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
-        """Extract document rows from DataTables, including hidden/paginated rows.
+        """Extract Toronto Supporting Documentation rows from the exact DOM contract.
 
-        Toronto's Supporting Documentation table stores the document name in the
-        first cell and the action in the fourth cell as:
+        The City page renders rows like:
 
-            <button class="downloadFile" data-id="...">Download</button>
+            <tr>
+              <td>Application Form</td>
+              <td>2026-06-26</td>
+              <td>1.39</td>
+              <td><button class="downloadFile" data-id="TOKEN">Download</button></td>
+            </tr>
 
-        DataTables often keeps only the current 10 DOM rows visible. Reading the
-        DataTables API gives all rows, including rows on later pages and rows
-        found through the table search box.
+        A normal href usually does not exist. The reliable signal is therefore
+        column 1 = document name plus column 4 = button.downloadFile[data-id].
+        DataTables may only render 10 visible rows, so this method also reads
+        DataTables' internal row data when available.
         """
         links: dict[str, str] = {}
         available: set[str] = set()
         rows_seen = 0
+        exact_token_rows = 0
 
         js = r"""
         () => {
             const out = [];
             const seen = new Set();
 
+            const clean = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+
             const textFromHtml = (value) => {
                 const raw = String(value ?? '');
                 const div = document.createElement('div');
                 div.innerHTML = raw;
-                return (div.innerText || div.textContent || raw).replace(/\s+/g, ' ').trim();
+                return clean(div.innerText || div.textContent || raw);
             };
 
-            const attrsFromHtml = (value) => {
-                const raw = String(value ?? '');
-                const attrs = [];
-                const div = document.createElement('div');
-                div.innerHTML = raw;
-                for (const node of div.querySelectorAll('a, button, input, [href], [src], [onclick], [data-id], [data-url], [data-href], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')) {
-                    const rec = {};
-                    if (!node.getAttributeNames) continue;
-                    for (const attr of node.getAttributeNames()) {
-                        const lower = attr.toLowerCase();
-                        if (['href', 'src', 'formaction', 'onclick'].includes(lower) || lower.startsWith('data')) {
-                            rec[lower] = node.getAttribute(attr);
-                        }
-                    }
-                    const cls = node.getAttribute('class');
-                    if (cls) rec.class = cls;
-                    if (Object.keys(rec).length) attrs.push(rec);
+            const collectAttrsFromRoot = (root) => {
+                const result = {data_ids: [], hrefs: [], onclicks: [], classes: []};
+                const add = (arr, value) => {
+                    const text = clean(value);
+                    if (text && !arr.includes(text)) arr.push(text);
+                };
+                if (!root) return result;
+
+                // Prefer the exact City control first. Its data-id is the real
+                // row token exposed in DevTools.
+                for (const node of root.querySelectorAll('button.downloadFile[data-id], .downloadFile[data-id]')) {
+                    add(result.data_ids, node.getAttribute('data-id'));
+                    add(result.classes, node.getAttribute('class'));
                 }
 
-                // Be tolerant of escaped HTML strings returned by DataTables.
-                for (const match of raw.matchAll(/data-id\s*=\s*["']([^"']+)["']/gi)) {
-                    attrs.push({'data-id': match[1], class: 'downloadFile'});
-                }
-                for (const match of raw.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
-                    attrs.push({href: match[1]});
-                }
-                return attrs;
-            };
-
-            const attrsFromNode = (root) => {
-                const attrs = [];
-                const nodes = [root, ...root.querySelectorAll('a, button, input, [href], [src], [onclick], [data-id], [data-url], [data-href], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')];
+                const nodes = [root, ...root.querySelectorAll('a, button, input, [href], [src], [formaction], [onclick], [data-id], [data-url], [data-href], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')];
                 for (const node of nodes) {
                     if (!node || !node.getAttributeNames) continue;
-                    const rec = {};
+                    const cls = node.getAttribute('class');
+                    if (cls) add(result.classes, cls);
                     for (const attr of node.getAttributeNames()) {
                         const lower = attr.toLowerCase();
-                        if (['href', 'src', 'formaction', 'onclick'].includes(lower) || lower.startsWith('data')) {
-                            rec[lower] = node.getAttribute(attr);
-                        }
+                        const value = node.getAttribute(attr);
+                        if (!value) continue;
+                        if (lower === 'data-id' || lower.endsWith('-id')) add(result.data_ids, value);
+                        if (lower === 'href' || lower === 'src' || lower === 'formaction' || lower.includes('url') || lower.includes('href')) add(result.hrefs, value);
+                        if (lower === 'onclick') add(result.onclicks, value);
                     }
-                    const cls = node.getAttribute('class');
-                    if (cls) rec.class = cls;
-                    if (Object.keys(rec).length) attrs.push(rec);
                 }
-                return attrs;
+                return result;
             };
 
-            const addRow = (source, cells, attrs) => {
+            const collectAttrsFromHtml = (value) => {
+                const raw = String(value ?? '');
+                const div = document.createElement('div');
+                div.innerHTML = raw;
+                const result = collectAttrsFromRoot(div);
+
+                // Be tolerant of escaped strings returned by DataTables.
+                const add = (arr, val) => {
+                    const text = clean(val);
+                    if (text && !arr.includes(text)) arr.push(text);
+                };
+                for (const match of raw.matchAll(/class\s*=\s*["']([^"']*downloadFile[^"']*)["'][\s\S]*?data-id\s*=\s*["']([^"']+)["']/gi)) {
+                    add(result.classes, match[1]);
+                    add(result.data_ids, match[2]);
+                }
+                for (const match of raw.matchAll(/data-id\s*=\s*["']([^"']+)["'][\s\S]*?class\s*=\s*["']([^"']*downloadFile[^"']*)["']/gi)) {
+                    add(result.data_ids, match[1]);
+                    add(result.classes, match[2]);
+                }
+                for (const match of raw.matchAll(/data-id\s*=\s*["']([^"']+)["']/gi)) add(result.data_ids, match[1]);
+                for (const match of raw.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) add(result.hrefs, match[1]);
+                for (const match of raw.matchAll(/onclick\s*=\s*["']([^"']+)["']/gi)) add(result.onclicks, match[1]);
+                return result;
+            };
+
+            const addRow = (source, firstCell, cells, attrs) => {
                 const safeCells = (cells || []).map(v => String(v ?? ''));
+                const first = textFromHtml(firstCell ?? safeCells[0] ?? '');
                 const text = safeCells.map(textFromHtml).join(' ').replace(/\s+/g, ' ').trim();
                 const html = safeCells.join(' ');
-                const dataIds = [];
-                const hrefs = [];
-                const onclicks = [];
-
-                for (const rec of attrs || []) {
-                    for (const [key, value] of Object.entries(rec)) {
-                        const lower = String(key).toLowerCase();
-                        const val = String(value ?? '').trim();
-                        if (!val) continue;
-                        if (lower === 'href' || lower === 'src' || lower === 'formaction' || lower.includes('url') || lower.includes('href')) hrefs.push(val);
-                        if (lower === 'onclick') onclicks.push(val);
-                        if (lower === 'data-id' || lower.endsWith('-id') || lower === 'id') dataIds.push(val);
-                    }
-                }
-
-                if (!text && !html && !dataIds.length && !hrefs.length) return;
-                const key = [source, text, dataIds.join('|'), hrefs.join('|')].join('||');
+                const dataIds = attrs?.data_ids || [];
+                const hrefs = attrs?.hrefs || [];
+                const onclicks = attrs?.onclicks || [];
+                const classes = attrs?.classes || [];
+                if (!first && !text && !dataIds.length && !hrefs.length) return;
+                const key = [source, first, text, dataIds.join('|'), hrefs.join('|')].join('||');
                 if (seen.has(key)) return;
                 seen.add(key);
-                out.push({source, text, html, data_ids: dataIds, hrefs, onclicks});
+                out.push({source, first_cell: first, text, html, data_ids: dataIds, hrefs, onclicks, classes});
             };
 
             const tables = Array.from(document.querySelectorAll('table'));
 
+            // DataTables internal data, including rows not currently visible in
+            // the 10-row DOM page.
             if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
                 for (const table of tables) {
                     try {
                         if (window.jQuery.fn.dataTable.isDataTable && !window.jQuery.fn.dataTable.isDataTable(table)) continue;
                         const dt = window.jQuery(table).DataTable();
-                        const data = dt.rows().data().toArray();
-                        for (const row of data.slice(0, 1000)) {
+                        try { if (dt.page && dt.page.len) dt.page.len(100).draw(false); } catch (e) {}
+
+                        let data = [];
+                        try { data = dt.rows().data().toArray(); } catch (e) { data = []; }
+                        for (const row of data.slice(0, 2000)) {
                             let cells = [];
                             if (Array.isArray(row)) cells = row;
                             else if (row && typeof row === 'object') cells = Object.values(row);
                             else cells = [row];
-                            const attrs = [];
-                            for (const cell of cells) attrs.push(...attrsFromHtml(cell));
-                            addRow('datatable', cells, attrs);
+                            const attrs = {data_ids: [], hrefs: [], onclicks: [], classes: []};
+                            for (const cell of cells) {
+                                const cellAttrs = collectAttrsFromHtml(cell);
+                                attrs.data_ids.push(...cellAttrs.data_ids);
+                                attrs.hrefs.push(...cellAttrs.hrefs);
+                                attrs.onclicks.push(...cellAttrs.onclicks);
+                                attrs.classes.push(...cellAttrs.classes);
+                            }
+                            addRow('datatable', cells[0], cells, attrs);
                         }
                     } catch (e) {}
                 }
             }
 
-            // DOM fallback for the currently visible page of the table.
+            // Currently visible DOM rows. This is the path matching the DevTools
+            // screenshot exactly: first td is the Reference File, fourth td has
+            // button.downloadFile[data-id].
             for (const tr of document.querySelectorAll('table tbody tr, table tr')) {
-                const cells = Array.from(tr.children || []).map(td => td.innerHTML || td.textContent || '');
-                addRow('dom', cells.length ? cells : [tr.innerHTML || tr.textContent || ''], attrsFromNode(tr));
+                const tds = Array.from(tr.querySelectorAll(':scope > td'));
+                const cells = tds.length ? tds.map(td => td.innerHTML || td.textContent || '') : [tr.innerHTML || tr.textContent || ''];
+                const firstCell = tds.length ? (tds[0].innerHTML || tds[0].textContent || '') : cells[0];
+                const attrs = collectAttrsFromRoot(tr);
+                addRow('dom', firstCell, cells, attrs);
             }
 
-            return out.slice(0, 1200);
+            return out.slice(0, 2500);
         }
         """
 
@@ -1276,42 +1383,48 @@ class TorontoOpenDataMonitor:
             try:
                 raw_rows = scope.evaluate(js) or []
             except Exception as exc:
-                LOGGER.info("Could not inspect Toronto DataTables document rows for %s: %s", base_url, exc)
+                LOGGER.info("Could not inspect exact Toronto downloadFile rows for %s: %s", base_url, exc)
                 raw_rows = []
 
             for row in raw_rows:
                 rows_seen += 1
-                text = normalize_key((row or {}).get("text") or (row or {}).get("html"))
+                if not isinstance(row, dict):
+                    continue
+                first_cell = normalize_key(row.get("first_cell"))
+                text = normalize_key(row.get("text") or row.get("html"))
                 if not text or "no matching records" in text.lower():
                     continue
 
-                document_name = self._document_name_for_text(text)
+                # Column 1 is authoritative. Fall back to full row text only for
+                # DataTables object rows where the first-cell order is unknown.
+                document_name = self._document_name_for_text(first_cell) or self._document_name_for_text(text)
                 if not document_name:
                     continue
                 available.add(document_name)
 
-                for href in (row or {}).get("hrefs") or []:
+                for href in row.get("hrefs") or []:
                     full_url = urljoin(base_url, normalize_key(href))
                     if self._is_meaningful_document_url(full_url, base_url):
                         links.setdefault(document_name, full_url)
                         break
 
                 if not links.get(document_name):
-                    data_ids = [normalize_key(value) for value in ((row or {}).get("data_ids") or []) if normalize_key(value)]
-                    # Prefer tokens attached to the visible Download button. Ignore generic table IDs.
+                    data_ids = [normalize_key(value) for value in (row.get("data_ids") or []) if normalize_key(value)]
                     if data_ids:
+                        exact_token_rows += 1
                         links.setdefault(document_name, self._download_button_fallback_url(base_url, document_name, data_ids[0]))
 
         if available:
             LOGGER.info(
-                "Detected Toronto document button rows for %s: rows_inspected=%s; required=%s; token_links=%s",
+                "Detected Toronto exact downloadFile rows for %s: rows_inspected=%s; token_rows=%s; required=%s; links=%s",
                 base_url,
                 rows_seen,
+                exact_token_rows,
                 ", ".join(sorted(available)),
                 ", ".join(sorted(links)) or "none",
             )
         else:
-            LOGGER.info("No required Toronto document button rows detected for %s after inspecting %s row(s)", base_url, rows_seen)
+            LOGGER.info("No required Toronto exact downloadFile rows detected for %s after inspecting %s row(s)", base_url, rows_seen)
 
         return links, available
 
