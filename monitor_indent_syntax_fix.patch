@@ -1,0 +1,195 @@
+--- a/dev_project_monitor/monitor.py	2026-07-16 05:38:45.053473633 +0000
++++ b/dev_project_monitor/monitor.py	2026-07-16 05:39:18.309939528 +0000
+@@ -353,6 +353,7 @@
+ 
+             if not item.get("file_number") and not item.get("address"):
+                 continue
++
+             actual_type = compact_key(item.get("application_type"))
+             if allowed_types and not self._type_matches(actual_type, allowed_types):
+                 continue
+@@ -360,30 +361,29 @@
+             date_value = parse_dt(item.get("submitted_date") or item.get("last_updated"))
+             if date_value and date_value < cutoff:
+                 continue
+-                normalized_rows.append(item)
+-    
+-            grouped = self._group_rows_by_application(normalized_rows)
+-            
+-            grouped.sort(
+-                key=lambda x: parse_dt(x.get("submitted_date") or x.get("last_updated"))
+-                or datetime.min.replace(tzinfo=timezone.utc),
+-                reverse=True,
+-            )
+-            
+-            max_candidates = int(
+-                self.config.get("max_candidates", self.config.get("max_records", 0)) or 0
+-            )
+-            
+-            if max_candidates > 0:
+-                grouped = grouped[:max_candidates]
+-            
+-            LOGGER.info(
+-                "Toronto Open Data filtered %d CSV metadata row(s) into %d application group(s)",
+-                len(normalized_rows),
+-                len(grouped),
+-            )
+-            
+-            return grouped
++
++            normalized_rows.append(item)
++
++        grouped = self._group_rows_by_application(normalized_rows)
++        grouped.sort(
++            key=lambda x: parse_dt(x.get("submitted_date") or x.get("last_updated"))
++            or datetime.min.replace(tzinfo=timezone.utc),
++            reverse=True,
++        )
++
++        max_candidates = int(
++            self.config.get("max_candidates", self.config.get("max_records", 0)) or 0
++        )
++        if max_candidates > 0:
++            grouped = grouped[:max_candidates]
++
++        LOGGER.info(
++            "Toronto Open Data filtered %d CSV metadata row(s) into %d application group(s)",
++            len(normalized_rows),
++            len(grouped),
++        )
++        return grouped
++
+     def _fetch_ckan_records(self) -> list[dict[str, Any]]:
+         """Fetch records from Toronto CKAN, preferring the daily CSV download.
+ 
+@@ -396,17 +396,29 @@
+         resources: list[dict[str, Any]] = []
+         raw_record_limit = int(self.config.get("raw_record_limit", 0) or 0)
+         try:
+-            package = self.http.get(f"{self.ckan_base}/package_show", params={"id": self.package_id}).json()
++            package = self.http.get(
++                f"{self.ckan_base}/package_show",
++                params={"id": self.package_id},
++            ).json()
+             if not package.get("success"):
+                 raise RuntimeError(f"CKAN package_show failed for {self.package_id}: {package}")
+             resources = package.get("result", {}).get("resources", []) or []
+         except Exception as exc:
+-            LOGGER.warning("Could not resolve Toronto CKAN package metadata; will try fallback CSV: %s", exc)
++            LOGGER.warning(
++                "Could not resolve Toronto CKAN package metadata; will try fallback CSV: %s",
++                exc,
++            )
+ 
+         urls_to_try: list[tuple[str, str, str]] = []
+         chosen = self._choose_csv_resource(resources)
+         if chosen and chosen.get("url"):
+-            urls_to_try.append((str(chosen["url"]), str(chosen.get("format", "csv")).lower(), str(chosen.get("name") or chosen.get("id") or "CSV resource")))
++            urls_to_try.append(
++                (
++                    str(chosen["url"]),
++                    str(chosen.get("format", "csv")).lower(),
++                    str(chosen.get("name") or chosen.get("id") or "CSV resource"),
++                )
++            )
+ 
+         if self.fallback_csv_url and all(url != self.fallback_csv_url for url, _, _ in urls_to_try):
+             urls_to_try.append((self.fallback_csv_url, "csv", "fallback Development Applications.csv"))
+@@ -417,7 +429,9 @@
+             if not url or url in {item[0] for item in urls_to_try}:
+                 continue
+             if fmt in {"csv", "json", "geojson"} or url.lower().endswith((".csv", ".json", ".geojson")):
+-                urls_to_try.append((url, fmt or "csv", str(resource.get("name") or resource.get("id") or "resource")))
++                urls_to_try.append(
++                    (url, fmt or "csv", str(resource.get("name") or resource.get("id") or "resource"))
++                )
+ 
+         for url, fmt, label in urls_to_try:
+             try:
+@@ -425,19 +439,29 @@
+                 if records:
+                     if raw_record_limit > 0:
+                         records = records[:raw_record_limit]
+-                     LOGGER.info("Toronto Open Data loaded %d record(s) from %s", len(records), label)
++                    LOGGER.info(
++                        "Toronto Open Data loaded %d record(s) from %s",
++                        len(records),
++                        label,
++                    )
+                     return records
+-             except Exception as exc:
+-                 LOGGER.warning("Could not read Toronto Open Data resource %s: %s", url, exc)
+- 
++            except Exception as exc:
++                LOGGER.warning("Could not read Toronto Open Data resource %s: %s", url, exc)
++
+         datastore_limit = int(self.config.get("datastore_max_records", 100000) or 100000)
+-         for resource in [r for r in resources if r.get("datastore_active")]:
+-             try:
++        for resource in [r for r in resources if r.get("datastore_active")]:
++            try:
+                 return self._fetch_datastore_records(resource["id"], max_records=datastore_limit)
+             except Exception as exc:
+-                LOGGER.warning("Could not read Toronto CKAN datastore resource %s: %s", resource.get("id"), exc)
++                LOGGER.warning(
++                    "Could not read Toronto CKAN datastore resource %s: %s",
++                    resource.get("id"),
++                    exc,
++                )
+ 
+-        raise RuntimeError("No usable Toronto Open Data CSV/JSON/datastore resource found for development-applications")
++        raise RuntimeError(
++            "No usable Toronto Open Data CSV/JSON/datastore resource found for development-applications"
++        )
+ 
+     def _choose_csv_resource(self, resources: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+         candidates = [
+@@ -570,6 +594,7 @@
+             "raw": record,
+         }
+         return item
++
+     def _group_rows_by_application(self, rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+         groups: dict[str, list[dict[str, Any]]] = {}
+     
+@@ -665,6 +690,7 @@
+                 out.append(text)
+     
+         return sorted(out, key=lambda value: compact_key(value))
++
+     def _validate_group_link(self, raw_url: str | None) -> dict[str, Any]:
+         raw_url = normalize_key(raw_url)
+         if not raw_url:
+@@ -1034,13 +1060,21 @@
+ 
+     def fetch_relevant_posts(self) -> list[dict[str, Any]]:
+         posts: list[dict[str, Any]] = []
++        lookback_days = int(self.config.get("lookback_days", 21))
++        cutoff = utcnow() - timedelta(days=lookback_days)
++        require_published_date = bool(self.config.get("require_published_date", False))
++
+         for site in self.config.get("sites", []):
+             site_posts = self._fetch_site_posts(site)
+             for post in site_posts:
+                 published_dt = parse_dt(post.get("published"))
+-                lookback = utcnow() - timedelta(days=int(self.config.get("lookback_days", 21)))
+-                if published_dt and published_dt < lookback:
++
++                if require_published_date and not published_dt:
++                    continue
++
++                if published_dt and published_dt < cutoff:
+                     continue
++
+                 enriched = self._enrich_post(post)
+                 score, evidence = self._score_post(enriched)
+                 if score >= int(self.config.get("minimum_keyword_score", 2)):
+@@ -1440,7 +1474,7 @@
+                 source="toronto_open_data",
+                 item_key=toronto_notification_key(app),
+                 title=title,
+-                url=app.get("detail_url") or app.get("raw_application_url") or None
++                url=app.get("detail_url") or app.get("raw_application_url") or None,
+                 kind="toronto_open_data",
+                 payload=app,
+             )
