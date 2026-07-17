@@ -127,3 +127,67 @@ def test_notification_key_prefers_canonical_url_over_poisoned_legacy_aic_key() -
     )[:40]
     assert result == canonical_key
     assert result != legacy_key
+
+
+def test_ready_application_scope_wins_over_stale_maintenance_frame() -> None:
+    monitor = make_monitor()
+
+    class Locator:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def inner_text(self, timeout: int = 0) -> str:
+            return self.value
+
+    class Scope:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def locator(self, _selector: str) -> Locator:
+            return Locator(self.value)
+
+        def evaluate(self, _script: str):
+            return {
+                "markers": {},
+                "textLength": len(self.value),
+                "loadingOnly": False,
+            }
+
+    monitor._document_scopes = lambda _page: [
+        Scope("We are currently performing maintenance. Try again later."),
+        Scope("Supporting Documentation Application Status Milestone Status"),
+    ]
+    assert monitor._application_service_state(object()) == "ready"
+
+
+def test_first_ready_poll_is_accepted_when_widget_probe_corroborates() -> None:
+    monitor = make_monitor()
+    monitor.config["application_service_retries"] = 1
+    monitor.config["application_service_timeout_seconds"] = 15
+    monitor.config["application_service_ready_confirmations"] = 2
+
+    states = iter(["ready", "maintenance"])
+    monitor._application_service_state = lambda _page: next(states)
+    monitor._application_widget_probe = lambda _page: {
+        "ready": True,
+        "marker_count": 3,
+        "strong_marker_count": 2,
+    }
+
+    class Mouse:
+        def wheel(self, _x: int, _y: int) -> None:
+            return None
+
+    class Page:
+        mouse = Mouse()
+
+        def goto(self, *_args, **_kwargs) -> None:
+            return None
+
+        def reload(self, *_args, **_kwargs) -> None:
+            return None
+
+        def wait_for_timeout(self, _ms: int) -> None:
+            return None
+
+    assert monitor._open_and_wait_for_application(Page(), "https://example.invalid") == "ready"

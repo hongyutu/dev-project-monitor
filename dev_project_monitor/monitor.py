@@ -975,6 +975,7 @@ class TorontoOpenDataMonitor:
                     debug_path = self._save_toronto_debug_artifacts(
                         page, network_recorder, diagnostics, reason
                     )
+                    diagnostics["failure_debug_path"] = debug_path
                     raise RuntimeError(
                         "Toronto's JavaScript application service did not become ready "
                         f"after {int(self.config.get('application_service_retries', 3) or 3)} "
@@ -996,6 +997,7 @@ class TorontoOpenDataMonitor:
                         diagnostics,
                         "supporting_documentation_not_expanded",
                     )
+                    diagnostics["failure_debug_path"] = debug_path
                     raise RuntimeError(
                         "Toronto Supporting Documentation did not expand or confirm an "
                         f"empty table. Debug artifacts: {debug_path or 'not saved'}"
@@ -1107,12 +1109,15 @@ class TorontoOpenDataMonitor:
                 )
                 return final_url, html_text
             except Exception:
-                try:
-                    self._save_toronto_debug_artifacts(
-                        page, network_recorder, diagnostics, "render_exception"
-                    )
-                except Exception:
-                    pass
+                # Avoid generating a second near-identical artifact directory
+                # when the precise failure branch already saved diagnostics.
+                if not diagnostics.get("failure_debug_path"):
+                    try:
+                        diagnostics["failure_debug_path"] = self._save_toronto_debug_artifacts(
+                            page, network_recorder, diagnostics, "render_exception"
+                        )
+                    except Exception:
+                        pass
                 raise
             finally:
                 try:
@@ -1179,7 +1184,13 @@ class TorontoOpenDataMonitor:
         }
 
     def _application_service_state(self, page: Any) -> str:
-        """Return ready, loading, maintenance, or unknown for Toronto's JS app."""
+        """Return ready, loading, maintenance, or unknown for Toronto's JS app.
+
+        Toronto's shell can retain a hidden maintenance template or a stale child
+        frame while the real application widget has already painted.  Positive
+        application evidence therefore has higher precedence than generic
+        maintenance wording found elsewhere in the page/frame tree.
+        """
         saw_loading = False
         saw_maintenance = False
 
@@ -1190,14 +1201,6 @@ class TorontoOpenDataMonitor:
                 continue
 
             lower = body.lower()
-            if (
-                "we are currently performing maintenance" in lower
-                or ("application is not available" in lower and "try again later" in lower)
-            ):
-                saw_maintenance = True
-            if re.search(r"\bloading(?:\.{0,3})?\b", lower):
-                saw_loading = True
-
             has_supporting = "supporting documentation" in lower
             has_application_data = any(
                 token in lower
@@ -1212,8 +1215,29 @@ class TorontoOpenDataMonitor:
                     "reference file",
                 )
             )
-            if has_supporting and has_application_data and not saw_maintenance:
+
+            # A scope containing both the document section and application data
+            # is the actual painted widget.  Do not let a maintenance template in
+            # another frame downgrade this evidence.
+            if has_supporting and has_application_data:
                 return "ready"
+
+            if (
+                "we are currently performing maintenance" in lower
+                or ("application is not available" in lower and "try again later" in lower)
+            ):
+                saw_maintenance = True
+            if re.search(r"\bloading(?:\.{0,3})?\b", lower):
+                saw_loading = True
+
+        # The widget can live inside an open shadow root.  Corroborate using the
+        # deeper marker probe before accepting a generic maintenance message.
+        try:
+            widget_probe = self._application_widget_probe(page)
+        except Exception:
+            widget_probe = {}
+        if bool(widget_probe.get("ready")):
+            return "ready"
 
         if saw_maintenance:
             return "maintenance"
@@ -1265,6 +1289,24 @@ class TorontoOpenDataMonitor:
                 final_state = state
                 if state == "ready":
                     ready_polls += 1
+
+                    # One positive body-text observation plus a successful
+                    # shadow/frame widget probe is stronger than two raw text
+                    # polls.  Accept it immediately so a stale maintenance frame
+                    # appearing on the next poll cannot erase a real render.
+                    try:
+                        corroborating_probe = self._application_widget_probe(page)
+                    except Exception:
+                        corroborating_probe = {}
+                    if bool(corroborating_probe.get("ready")):
+                        LOGGER.info(
+                            "Toronto application service ready on attempt %d/%d "
+                            "(corroborated by application widget markers)",
+                            attempt,
+                            retries,
+                        )
+                        return "ready"
+
                     if ready_polls >= confirmations:
                         LOGGER.info(
                             "Toronto application service ready on attempt %d/%d",

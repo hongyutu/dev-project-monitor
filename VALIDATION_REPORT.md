@@ -5,13 +5,15 @@
 - `dev_project_monitor/monitor.py` passes Python compilation.
 - The package imports and its CLI help renders successfully.
 - Both YAML configuration files parse successfully.
-- Six reconciliation regression tests pass:
+- Eight reconciliation regression tests pass:
   - legacy AIC folder URLs are rejected as documents;
   - Application Details URLs are not treated as direct files;
   - proven document-row availability is preserved;
   - application-service readiness distinguishes loading, ready, and maintenance;
   - notifications label page-only availability correctly;
-  - canonical Toronto state keys supersede poisoned legacy AIC keys.
+  - canonical Toronto state keys supersede poisoned legacy AIC keys;
+  - a real application scope wins over stale maintenance text in another frame;
+  - a corroborated first ready poll survives the observed `ready -> maintenance` transition.
 
 ## Live browser limitation in this workspace
 

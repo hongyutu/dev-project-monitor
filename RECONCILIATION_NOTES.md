@@ -11,7 +11,7 @@ actual `dev_project_monitor.monitor` execution path.
 - Does not override `navigator.userAgent` or silently switch executables.
 - Waits for Toronto's JavaScript application service, not only
   `DOMContentLoaded`.
-- Requires two consecutive ready observations before document processing.
+- Accepts a ready observation immediately when it is independently corroborated by application-widget markers; otherwise it retains the configurable consecutive-poll requirement.
 - Targets **Supporting Documentation** directly; page-wide **Expand All** is not
   used.
 - Treats `button.downloadFile[data-id]` as an opaque UI control, never a URL.
@@ -40,3 +40,15 @@ python -m dev_project_monitor.monitor \
 The GitHub Actions `workflow_dispatch` form now has a `diagnose_url` input that
 runs the same state-free diagnosis. Failed runs upload `data/toronto_debug` as a
 workflow artifact.
+
+## July 17 readiness hotfix
+
+GitHub Actions showed the application in this sequence: `loading -> ready -> maintenance`.
+The previous classifier allowed a generic maintenance template or stale child frame to
+downgrade an already-painted application widget. The reconciled classifier now:
+
+- gives real application evidence precedence over maintenance text in another scope;
+- probes open shadow roots and child frames for application-specific markers;
+- accepts the first ready poll when those markers corroborate it; and
+- saves only one debug bundle for a single failure instead of duplicate
+  `maintenance_response` and `render_exception` directories.
