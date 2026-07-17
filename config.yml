@@ -10,7 +10,7 @@ toronto:
   max_records: 0
   raw_record_limit: 0
   max_candidates: 500
-  lookback_days: 15
+  lookback_days: 16
   application_types:
   - OZ
   - SA
