@@ -25,6 +25,7 @@ import time
 import textwrap
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qs, quote_plus, urlencode, unquote_plus, urljoin, urlparse
 
@@ -60,20 +61,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dry_run_max_detail_pages": 5,
         "raw_record_limit": 0,
         "render_with_playwright": True,
-        "require_dynamic_application_widget": True,
-        "application_widget_wait_seconds": 30,
-        "document_api_replay_timeout_ms": 5000,
-        "document_api_replay_max_attempts": 12,
-        "document_api_replay_total_seconds": 25,
-        "report_partial_on_enrichment_failure": True,
+        "browser_channel": "chromium",
+        "browser_profile_dir": "data/toronto_browser_profile",
+        "application_service_timeout_seconds": 90,
+        "application_service_retries": 3,
+        "application_service_poll_ms": 750,
+        "application_service_ready_confirmations": 2,
+        "report_partial_on_enrichment_failure": False,
         "save_debug_artifacts_on_failure": True,
         "debug_artifacts_dir": "data/toronto_debug",
         "page_timeout_ms": 60000,
-        "post_load_wait_ms": 2500,
         "ocr_image_pdfs": True,
         "extract_application_form_contacts": True,
-        "application_form_download_timeout_ms": 12000,
-        "playwright_default_timeout_ms": 1800,
+        "application_form_download_timeout_ms": 30000,
+        "playwright_default_timeout_ms": 2500,
         "supporting_docs_mount_wait_seconds": 9,
         "document_rows_wait_seconds": 6,
         "inspect_child_frames": True,
@@ -836,29 +837,47 @@ class TorontoOpenDataMonitor:
         )
 
     def _is_meaningful_document_url(self, candidate: str, base_url: str) -> bool:
+        """Return True only for a plausible direct document endpoint.
+
+        Toronto's legacy AIC ``folderRsn`` route and the current Application
+        Details page are navigation pages, not files.  A ``data-id`` token is
+        likewise not a URL.  Keeping this test strict prevents a folder page
+        from being reported as a Civil/Utilities document.
+        """
         candidate = normalize_key(candidate)
         if not candidate:
             return False
         lowered = candidate.lower()
         if lowered.startswith(("blob:", "about:", "javascript:", "mailto:", "tel:", "#")):
             return False
+
         full_url = urljoin(base_url, candidate)
         if self._is_static_asset_url(full_url):
             return False
 
+        parsed = urlparse(full_url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        query = parsed.query.lower()
+
+        # Never report Toronto application/folder navigation as a document.
+        if host in {"app.toronto.ca", "secure.toronto.ca"} and "/aic/" in path:
+            return False
+        if "/aic/" in path and "folderrsn=" in query:
+            return False
+        if "/application-details/" in path:
+            return False
+
         base_no_hash = normalize_key(base_url).split("#", 1)[0]
         full_no_hash = full_url.split("#", 1)[0]
-        parsed = urlparse(full_url)
         if base_no_hash and full_no_hash == base_no_hash:
-            # A same-page fragment is navigation only.  In particular,
-            # button.downloadFile[data-id] exposes an opaque JavaScript token,
-            # not a retrievable file URL.
             return False
 
-        if "/application-details/" in parsed.path and not re.search(r"download|document|attachment|file", parsed.query, re.I):
-            return False
-
-        return True
+        # Require file/download evidence.  Opaque UI tokens are handled by
+        # clicking their actual Download buttons, never by URL construction.
+        if re.search(r"\.(?:pdf|zip|docx?|xlsx?|dwg|dxf)(?:$|[?&])", path + ("?" + query if query else ""), re.I):
+            return True
+        return bool(re.search(r"(?:download|attachment|document|file)", path + "?" + query, re.I))
 
     def _download_links_fixture_html(
         self,
@@ -906,13 +925,13 @@ class TorontoOpenDataMonitor:
         )
 
     def _fetch_rendered_page(self, url: str) -> tuple[str, str]:
-        """Render and verify the Toronto application widget before enrichment.
+        """Render one Toronto application using the proven crawler lifecycle.
 
-        The WordPress page returned by ``requests`` contains only a static shell
-        with the word ``Loading``.  Treating that shell as a successful detail
-        page caused every supporting document and Application Form contact to be
-        reported as ``Not found``.  Toronto enrichment therefore requires a
-        functioning browser and a positive widget-readiness probe.
+        The outer City page can finish ``DOMContentLoaded`` while its planning
+        application service is still showing only a Loading shell.  This method
+        waits for application-specific content, uses a persistent native
+        Playwright Chromium profile, expands Supporting Documentation directly,
+        and never replays the legacy document API as a fallback.
         """
         if not self.config.get("render_with_playwright", True):
             raise RuntimeError(
@@ -929,217 +948,153 @@ class TorontoOpenDataMonitor:
             ) from exc
 
         diagnostics: dict[str, Any] = {"requested_url": url}
-        with sync_playwright() as p:
-            browser, launch_info = self._launch_toronto_browser(p)
+        with sync_playwright() as playwright:
+            context, launch_info = self._launch_toronto_context(playwright)
             diagnostics["browser_launch"] = launch_info
-            browser_user_agent = self.config.get("browser_user_agent") or (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(
+                int(self.config.get("playwright_default_timeout_ms", 2500) or 2500)
             )
-            context = browser.new_context(
-                viewport={"width": 1365, "height": 2400},
-                user_agent=browser_user_agent,
-                accept_downloads=True,
-                locale="en-CA",
+            page.set_default_navigation_timeout(
+                int(self.config.get("page_timeout_ms", 60000) or 60000)
             )
-            page = context.new_page()
-            page.set_default_timeout(int(self.config.get("playwright_default_timeout_ms", 1800) or 1800))
-            page.set_default_navigation_timeout(int(self.config.get("page_timeout_ms", 60000) or 60000))
-            network_recorder = self._install_toronto_network_recorder(page)
+            network_recorder = self._install_toronto_network_recorder(context)
 
             try:
-                page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=int(self.config.get("page_timeout_ms", 60000)),
-                )
+                service_state = self._open_and_wait_for_application(page, url)
+                final_url = normalize_key(page.url) or url
+                diagnostics["application_service_state"] = service_state
+                diagnostics["final_url"] = final_url
+
+                if service_state != "ready":
+                    reason = (
+                        "maintenance_response"
+                        if service_state == "maintenance"
+                        else "application_service_timeout"
+                    )
+                    debug_path = self._save_toronto_debug_artifacts(
+                        page, network_recorder, diagnostics, reason
+                    )
+                    raise RuntimeError(
+                        "Toronto's JavaScript application service did not become ready "
+                        f"after {int(self.config.get('application_service_retries', 3) or 3)} "
+                        f"attempt(s); final state={service_state}. "
+                        f"Debug artifacts: {debug_path or 'not saved'}"
+                    )
+
+                self._log_toronto_browser_identity(page)
+                diagnostics["widget_probe"] = self._application_widget_probe(page)
+                mount_probe = self._scroll_until_supporting_docs_mounted(page)
+                diagnostics["supporting_docs_mount_probe"] = mount_probe
+
+                section_state = self._expand_supporting_documentation(page)
+                diagnostics["supporting_documentation_state"] = section_state
+                if not section_state.get("open"):
+                    debug_path = self._save_toronto_debug_artifacts(
+                        page,
+                        network_recorder,
+                        diagnostics,
+                        "supporting_documentation_not_expanded",
+                    )
+                    raise RuntimeError(
+                        "Toronto Supporting Documentation did not expand or confirm an "
+                        f"empty table. Debug artifacts: {debug_path or 'not saved'}"
+                    )
+
+                for scope in self._document_scopes(page):
+                    self._set_document_table_to_all_rows(scope)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=3500)
+                    page.wait_for_timeout(800)
                 except Exception:
                     pass
-                page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
 
-                # The folderRsn route can update page.url to the canonical
-                # id/pid/title URL after initializing the application widget.
-                # Do not navigate a second time. The July 17 GitHub Actions run
-                # showed that this reload discarded the initialized widget and
-                # left only the static City "Loading" shell.
-                normalized_start = self._application_details_url(url) or html.unescape(normalize_key(url))
-                normalized_current = self._application_details_url(page.url) or html.unescape(normalize_key(page.url))
-                if normalized_current and normalized_current != normalized_start:
-                    LOGGER.info(
-                        "Toronto render URL changed in-place: %s -> %s; retaining the live page without reload",
-                        normalized_start,
-                        normalized_current,
-                    )
+                button_links, button_available = self._wait_for_toronto_download_rows(
+                    page, final_url
+                )
 
-                widget_probe = self._wait_for_application_widget(page)
-                diagnostics["widget_probe"] = widget_probe
-                widget_ready = bool(widget_probe.get("ready"))
-                mount_probe: dict[str, Any] = {
-                    "downloadButtons": 0,
-                    "supportingTextMatches": 0,
-                    "referenceFileMatches": 0,
-                    "documentRows": 0,
+                # Search the mounted DataTable for required categories that may
+                # be on another page.  This only interrogates the proven DOM; it
+                # does not replay arbitrary XHR/fetch calls.
+                missing_names = [
+                    name for name in self.REQUIRED_DOCUMENTS if name not in button_available
+                ]
+                search_terms = {
+                    "Application Form": ["Application Form", "Application"],
+                    "Architectural Plans": [
+                        "Architectural Plans", "Architectural", "Floor Plan", "Elevation"
+                    ],
+                    "Civil and Utilities Plans": [
+                        "Civil and Utilities", "Civil", "Utilities", "Servicing",
+                        "Grading", "Stormwater"
+                    ],
+                    "Geotechnical Study": ["Geotechnical Study", "Geotechnical", "Soil"],
+                    "Hydrogeological Report": [
+                        "Hydrogeological Report", "Hydrogeological", "Hydrogeology",
+                        "Groundwater", "Dewatering"
+                    ],
                 }
-
-                if widget_ready:
-                    mount_probe = self._scroll_until_supporting_docs_mounted(page)
-                    diagnostics["supporting_docs_mount_probe"] = mount_probe
-                    self._expand_supporting_documentation(page)
-                    for scope in self._document_scopes(page):
-                        self._set_document_table_to_all_rows(scope)
-
-                    # Trigger lazy content in the main page and application frames.
-                    for scope in self._document_scopes(page):
-                        try:
-                            scope.evaluate("window.scrollTo(0, document.body ? document.body.scrollHeight : 0)")
-                        except Exception:
-                            pass
-                    page.wait_for_timeout(800)
-                else:
-                    debug_path = self._save_toronto_debug_artifacts(
-                        page, network_recorder, diagnostics, "widget_not_ready"
-                    )
-                    diagnostics["widget_not_ready_debug_path"] = debug_path
-                    LOGGER.warning(
-                        "Toronto application widget did not paint; continuing with recorded XHR/fetch API replay instead of dropping the application. "
-                        "Debug artifacts: %s",
-                        debug_path or "not saved",
-                    )
-
-                final_url = page.url
-                network_links, network_available = self._extract_network_document_data(
-                    network_recorder, final_url
-                )
-                # This fallback must run even when the widget/DOM is blank. The
-                # initial folderRsn navigation may already have completed the
-                # application/document API requests before the visual widget failed.
-                replay_links, replay_available, replay_diagnostics = self._replay_document_api_requests(
-                    context, network_recorder, final_url
-                )
-                diagnostics["document_api_replay"] = replay_diagnostics
-                network_available.update(replay_available)
-                for name, href in replay_links.items():
-                    if href and not network_links.get(name):
-                        network_links[name] = href
-
-                button_links: dict[str, str] = {}
-                button_available: set[str] = set()
-                visible_available: set[str] = set()
-
-                if widget_ready:
-                    button_links, button_available = self._wait_for_toronto_download_rows(page, final_url)
-
-                    # Search the DataTable only after the widget and section are proven ready.
-                    missing_names = [name for name in self.REQUIRED_DOCUMENTS if name not in button_available]
-                    if missing_names:
-                        search_terms = {
-                            "Application Form": ["Application Form", "Application"],
-                            "Architectural Plans": ["Architectural Plans", "Architectural", "Floor Plan", "Elevation"],
-                            "Civil and Utilities Plans": ["Civil and Utilities", "Civil", "Utilities", "Servicing", "Grading", "Stormwater"],
-                            "Geotechnical Study": ["Geotechnical Study", "Geotechnical", "Soil"],
-                            "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater", "Dewatering"],
-                        }
-                        for required_name in missing_names:
-                            for term in search_terms.get(required_name, [required_name]):
-                                for scope in self._document_scopes(page):
-                                    self._set_document_table_to_all_rows(scope, term)
-                                self._force_supporting_docs_visible(page)
-                                more_links, more_available = self._extract_download_button_document_rows(page, final_url)
-                                button_available.update(more_available)
-                                for name, href in more_links.items():
-                                    if href and not button_links.get(name):
-                                        button_links[name] = href
-                                if required_name in button_available:
-                                    break
+                for required_name in missing_names:
+                    for term in search_terms.get(required_name, [required_name]):
                         for scope in self._document_scopes(page):
-                            self._set_document_table_to_all_rows(scope)
+                            self._set_document_table_to_all_rows(scope, term)
+                        more_links, more_available = self._extract_download_button_document_rows(
+                            page, final_url
+                        )
+                        button_available.update(more_available)
+                        for name, href in more_links.items():
+                            if href and not button_links.get(name):
+                                button_links[name] = href
+                        if required_name in button_available:
+                            break
 
-                    visible_available = self._document_names_visible_on_page(page)
+                for scope in self._document_scopes(page):
+                    self._set_document_table_to_all_rows(scope)
 
-                document_links = dict(network_links)
-                for name, href in button_links.items():
-                    if href and not document_links.get(name):
-                        document_links[name] = href
-
+                visible_available = self._document_names_visible_on_page(page)
+                document_links = {
+                    name: href
+                    for name, href in button_links.items()
+                    if self._is_meaningful_document_url(href, final_url)
+                }
                 available_names = (
-                    set(network_available)
-                    | set(button_available)
+                    set(button_available)
                     | set(visible_available)
                     | set(document_links)
                 )
 
                 html_text = self._combined_page_content(page)
-                html_text += self._download_links_fixture_html(document_links, available_names, final_url)
+                html_text += self._download_links_fixture_html(
+                    document_links, available_names, final_url
+                )
 
                 application_form_text = ""
-                if self.config.get("extract_application_form_contacts", True) and "Application Form" in available_names:
-                    if widget_ready:
-                        application_form_text = self._extract_application_form_text_from_page(page, final_url)
-                    if not normalize_key(application_form_text):
-                        direct_form_url = document_links.get("Application Form")
-                        if direct_form_url:
-                            try:
-                                file_bytes = self._read_browser_url_bytes(
-                                    page,
-                                    direct_form_url,
-                                    int(self.config.get("application_form_download_timeout_ms", 12000) or 12000),
-                                )
-                                application_form_text = self._extract_application_form_text_from_bytes(
-                                    file_bytes,
-                                    urlparse(direct_form_url).path.rsplit("/", 1)[-1],
-                                )
-                            except Exception as exc:
-                                LOGGER.info("Direct Application Form browser read failed for %s: %s", final_url, exc)
+                if (
+                    self.config.get("extract_application_form_contacts", True)
+                    and "Application Form" in available_names
+                ):
+                    application_form_text = self._extract_application_form_text_from_page(
+                        page, final_url
+                    )
                     if normalize_key(application_form_text):
-                        html_text += self._application_form_text_fixture_html(application_form_text)
+                        html_text += self._application_form_text_fixture_html(
+                            application_form_text
+                        )
+                    else:
+                        html_text += (
+                            '\n<div id="toronto-enrichment-status" '
+                            'data-status="application-form-contacts-not-extracted"></div>\n'
+                        )
 
                 final_probe = self._supporting_docs_probe(page)
                 diagnostics.update(
                     {
-                        "final_url": final_url,
                         "final_supporting_docs_probe": final_probe,
                         "available_document_names": sorted(available_names),
                         "direct_document_links": sorted(document_links),
                         "application_form_text_chars": len(application_form_text or ""),
+                        "document_api_fallback_used": False,
                     }
                 )
-
-                # Preserve useful metadata/documents even when the visual widget
-                # or Application Form contact extraction is incomplete. The run
-                # controller reports this once as a partial result and leaves the
-                # original application key queued for a later retry.
-                partial_reasons: list[str] = []
-                if not widget_ready:
-                    partial_reasons.append("widget-not-ready")
-
-                supporting_section_found = bool(
-                    final_probe.get("supportingTextMatches")
-                    or final_probe.get("referenceFileMatches")
-                    or mount_probe.get("supportingTextMatches")
-                    or mount_probe.get("referenceFileMatches")
-                )
-                if not available_names and not supporting_section_found:
-                    partial_reasons.append("supporting-section-not-detected")
-                    debug_path = self._save_toronto_debug_artifacts(
-                        page, network_recorder, diagnostics, "supporting_section_missing"
-                    )
-                    diagnostics["supporting_section_missing_debug_path"] = debug_path
-
-                if (
-                    self.config.get("extract_application_form_contacts", True)
-                    and "Application Form" in available_names
-                    and not normalize_key(application_form_text)
-                ):
-                    partial_reasons.append("application-form-contacts-not-extracted")
-
-                for reason in dict.fromkeys(partial_reasons):
-                    html_text += (
-                        '\n<div id="toronto-enrichment-status" '
-                        f'data-status="{html.escape(reason, quote=True)}"></div>\n'
-                    )
-                diagnostics["partial_reasons"] = list(dict.fromkeys(partial_reasons))
 
                 LOGGER.info(
                     "Supporting Documentation for %s: direct_links=%s; available_rows=%s; "
@@ -1152,8 +1107,6 @@ class TorontoOpenDataMonitor:
                 )
                 return final_url, html_text
             except Exception:
-                # Save diagnostics before closing the browser. The exception is
-                # intentionally propagated; never fall back to the static shell.
                 try:
                     self._save_toronto_debug_artifacts(
                         page, network_recorder, diagnostics, "render_exception"
@@ -1164,50 +1117,223 @@ class TorontoOpenDataMonitor:
             finally:
                 try:
                     context.close()
-                finally:
-                    browser.close()
+                except Exception:
+                    pass
 
-    def _launch_toronto_browser(self, playwright: Any) -> tuple[Any, dict[str, Any]]:
-        """Launch bundled Chromium, then a known system Chromium if necessary."""
-        attempts: list[str] = []
-        common_args = ["--disable-dev-shm-usage"]
+    def _launch_toronto_context(self, playwright: Any) -> tuple[Any, dict[str, Any]]:
+        """Launch Playwright's bundled Chromium with one persistent native profile."""
+        profile_dir = Path(
+            self.config.get("browser_profile_dir")
+            or self.config.get("playwright_profile_dir")
+            or "data/toronto_browser_profile"
+        )
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        # Remove stale Chromium singleton files left by a cancelled CI job.
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            try:
+                (profile_dir / name).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        args = ["--disable-dev-shm-usage"]
         if os.name != "nt":
-            common_args.append("--no-sandbox")
+            args.append("--no-sandbox")
+
+        browser_channel = normalize_key(
+            self.config.get("browser_channel") or "chromium"
+        ).lower()
+        kwargs: dict[str, Any] = {
+            "headless": not bool(self.config.get("headed", False)),
+            "accept_downloads": True,
+            "locale": "en-CA",
+            "timezone_id": "America/Toronto",
+            "viewport": {"width": 1440, "height": 1000},
+            "args": args,
+        }
+        if browser_channel in {"chrome", "msedge"}:
+            kwargs["channel"] = browser_channel
+            label = f"system {browser_channel}"
+        else:
+            # channel omitted means the Chromium binary versioned with this
+            # exact Playwright installation.  Do not override userAgent or
+            # silently substitute another executable.
+            label = "Playwright-bundled Chromium"
+            LOGGER.info("Bundled Chromium executable: %s", playwright.chromium.executable_path)
 
         try:
-            browser = playwright.chromium.launch(headless=True, args=common_args)
-            return browser, {"mode": "playwright-bundled", "attempts": attempts}
+            context = playwright.chromium.launch_persistent_context(
+                str(profile_dir.resolve()),
+                **kwargs,
+            )
         except Exception as exc:
-            attempts.append(f"bundled Chromium: {exc}")
+            raise RuntimeError(
+                f"Could not launch {label} with persistent profile {profile_dir}: {exc}"
+            ) from exc
 
-        explicit = normalize_key(os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"))
-        candidates = [explicit] if explicit else []
-        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome", "msedge"):
-            path = shutil.which(name)
-            if path and path not in candidates:
-                candidates.append(path)
+        return context, {
+            "mode": "persistent-context",
+            "browser": label,
+            "profile_dir": str(profile_dir),
+            "native_user_agent": True,
+        }
 
-        for executable in candidates:
+    def _application_service_state(self, page: Any) -> str:
+        """Return ready, loading, maintenance, or unknown for Toronto's JS app."""
+        saw_loading = False
+        saw_maintenance = False
+
+        for scope in self._document_scopes(page):
             try:
-                browser = playwright.chromium.launch(
-                    headless=True,
-                    executable_path=executable,
-                    args=common_args,
-                )
-                return browser, {
-                    "mode": "system-chromium",
-                    "executable": executable,
-                    "attempts": attempts,
-                }
-            except Exception as exc:
-                attempts.append(f"{executable}: {exc}")
+                body = normalize_key(scope.locator("body").inner_text(timeout=900))
+            except Exception:
+                continue
 
-        joined = " | ".join(shorten(value, 350) for value in attempts)
-        raise RuntimeError(
-            "No usable Chromium browser could be launched for Toronto's dynamic page. "
-            "Run `python -m playwright install chromium` or set "
-            "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH. Attempts: " + joined
+            lower = body.lower()
+            if (
+                "we are currently performing maintenance" in lower
+                or ("application is not available" in lower and "try again later" in lower)
+            ):
+                saw_maintenance = True
+            if re.search(r"\bloading(?:\.{0,3})?\b", lower):
+                saw_loading = True
+
+            has_supporting = "supporting documentation" in lower
+            has_application_data = any(
+                token in lower
+                for token in (
+                    "milestone status",
+                    "application submitted",
+                    "application details url",
+                    "related applications",
+                    "view all properties",
+                    "application status",
+                    "application number",
+                    "reference file",
+                )
+            )
+            if has_supporting and has_application_data and not saw_maintenance:
+                return "ready"
+
+        if saw_maintenance:
+            return "maintenance"
+        if saw_loading:
+            return "loading"
+        return "unknown"
+
+    def _open_and_wait_for_application(self, page: Any, url: str) -> str:
+        """Navigate with bounded retries until the application service is stable."""
+        retries = max(1, int(self.config.get("application_service_retries", 3) or 3))
+        timeout_seconds = max(
+            15.0,
+            float(self.config.get("application_service_timeout_seconds", 90) or 90),
         )
+        poll_ms = max(250, int(self.config.get("application_service_poll_ms", 750) or 750))
+        confirmations = max(
+            1,
+            int(self.config.get("application_service_ready_confirmations", 2) or 2),
+        )
+        final_state = "unknown"
+
+        for attempt in range(1, retries + 1):
+            if attempt == 1:
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=int(self.config.get("page_timeout_ms", 60000) or 60000),
+                )
+            else:
+                delay_ms = min(10000, 1500 * (2 ** (attempt - 2)))
+                LOGGER.info(
+                    "Retrying Toronto application service in %.1f second(s) "
+                    "(attempt %d/%d)",
+                    delay_ms / 1000,
+                    attempt,
+                    retries,
+                )
+                page.wait_for_timeout(delay_ms)
+                page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=int(self.config.get("page_timeout_ms", 60000) or 60000),
+                )
+
+            deadline = time.monotonic() + timeout_seconds
+            last_reported = ""
+            ready_polls = 0
+            while time.monotonic() < deadline:
+                state = self._application_service_state(page)
+                final_state = state
+                if state == "ready":
+                    ready_polls += 1
+                    if ready_polls >= confirmations:
+                        LOGGER.info(
+                            "Toronto application service ready on attempt %d/%d",
+                            attempt,
+                            retries,
+                        )
+                        return "ready"
+                else:
+                    ready_polls = 0
+
+                if state != last_reported:
+                    LOGGER.info(
+                        "Waiting for Toronto application service: %s (attempt %d/%d)",
+                        state,
+                        attempt,
+                        retries,
+                    )
+                    last_reported = state
+
+                if state == "maintenance":
+                    break
+                try:
+                    page.mouse.wheel(0, 500)
+                except Exception:
+                    pass
+                page.wait_for_timeout(poll_ms)
+
+            LOGGER.warning(
+                "Toronto application service wait expired on attempt %d/%d; last state=%s",
+                attempt,
+                retries,
+                final_state,
+            )
+
+        return final_state
+
+    def _log_toronto_browser_identity(self, page: Any) -> None:
+        """Log the native browser identity without overriding/spoofing it."""
+        try:
+            identity = page.evaluate(
+                """async () => {
+                    const uaData = navigator.userAgentData;
+                    let high = null;
+                    if (uaData && uaData.getHighEntropyValues) {
+                        try {
+                            high = await uaData.getHighEntropyValues([
+                                'architecture', 'bitness', 'fullVersionList',
+                                'model', 'platformVersion', 'wow64'
+                            ]);
+                        } catch (e) {}
+                    }
+                    return {
+                        userAgent: navigator.userAgent,
+                        brands: uaData ? uaData.brands : null,
+                        mobile: uaData ? uaData.mobile : null,
+                        platform: uaData ? uaData.platform : navigator.platform,
+                        language: navigator.language,
+                        languages: navigator.languages,
+                        webdriver: navigator.webdriver,
+                        highEntropy: high
+                    };
+                }"""
+            )
+            LOGGER.info(
+                "Native browser identity (not overridden): %s",
+                json.dumps(identity, ensure_ascii=False, sort_keys=True),
+            )
+        except Exception as exc:
+            LOGGER.debug("Could not log browser identity: %s", exc)
 
     def _application_widget_probe(self, page: Any) -> dict[str, Any]:
         """Probe all relevant scopes, including open shadow roots."""
@@ -1274,25 +1400,6 @@ class TorontoOpenDataMonitor:
             "scopes": details,
         }
 
-    def _wait_for_application_widget(self, page: Any) -> dict[str, Any]:
-        timeout_seconds = float(self.config.get("application_widget_wait_seconds", 30) or 30)
-        deadline = time.monotonic() + timeout_seconds
-        best: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            best = self._application_widget_probe(page)
-            if best.get("ready"):
-                LOGGER.info(
-                    "Toronto application widget ready: scopes=%s markers=%s",
-                    best.get("scope_count"),
-                    best.get("marker_count"),
-                )
-                return best
-            try:
-                page.wait_for_timeout(750)
-            except Exception:
-                break
-        LOGGER.warning("Toronto application widget readiness timed out: %s", best)
-        return best
 
     def _safe_debug_slug(self, value: str) -> str:
         slug = re.sub(r"[^A-Za-z0-9._-]+", "_", normalize_key(value)).strip("_")
@@ -1394,122 +1501,6 @@ class TorontoOpenDataMonitor:
         LOGGER.warning("Toronto debug artifacts saved to %s", out_dir)
         return out_dir
 
-    def _replay_document_api_requests(
-        self,
-        context: Any,
-        recorder: dict[str, Any],
-        base_url: str,
-    ) -> tuple[dict[str, str], set[str], dict[str, Any]]:
-        """Replay a bounded, prioritized set of completed XHR/fetch requests.
-
-        The replay shares browser cookies and preserves safe request headers. It
-        is intentionally capped by both request count and total wall-clock time
-        so a broken City endpoint cannot stall an entire monitor run.
-        """
-        links: dict[str, str] = {}
-        available: set[str] = set()
-        attempts: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
-        per_request_timeout_ms = int(self.config.get("document_api_replay_timeout_ms", 5000) or 5000)
-        max_attempts = int(self.config.get("document_api_replay_max_attempts", 12) or 12)
-        total_seconds = float(self.config.get("document_api_replay_total_seconds", 25) or 25)
-        deadline = time.monotonic() + max(2.0, total_seconds)
-        requests_meta = recorder.get("requests", []) if isinstance(recorder, dict) else []
-        deny_tokens = (
-            "google-analytics", "googletagmanager", "doubleclick", "medallia",
-            "qualtrics", "hotjar", "facebook", "twitter", "youtube",
-            "translate.google", "recaptcha",
-        )
-        priority_tokens = (
-            "document", "attachment", "download", "file", "support",
-            "application", "aic", "folder", "submission", "planning",
-        )
-
-        candidates: list[tuple[int, int, dict[str, Any]]] = []
-        for index, item in enumerate(requests_meta[:300]):
-            if not isinstance(item, dict):
-                continue
-            url = normalize_key(item.get("url"))
-            resource_type = normalize_key(item.get("resource_type")).lower()
-            if not url or resource_type not in {"xhr", "fetch"} or self._is_static_asset_url(url):
-                continue
-            lowered = url.lower()
-            if any(token in lowered for token in deny_tokens):
-                continue
-            method = normalize_key(item.get("method") or "GET").upper()
-            score = sum(5 for token in priority_tokens if token in lowered)
-            score += 3 if method not in {"GET", "HEAD"} else 0
-            score += 2 if "json" in normalize_key(item.get("content_type")).lower() else 0
-            candidates.append((score, -index, item))
-
-        for _score, _neg_index, item in sorted(candidates, reverse=True):
-            if len(attempts) >= max_attempts or time.monotonic() >= deadline:
-                break
-            url = normalize_key(item.get("url"))
-            method = normalize_key(item.get("method") or "GET").upper()
-            post_data = item.get("post_data")
-            key = (method, url, normalize_key(post_data))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            captured_headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
-            request_headers: dict[str, str] = {
-                str(k).lower(): str(v) for k, v in captured_headers.items() if normalize_key(v)
-            }
-            request_headers.setdefault("accept", "application/json,text/plain,text/html,*/*")
-            request_headers.setdefault("referer", base_url)
-            content_type = normalize_key(item.get("content_type"))
-            if content_type:
-                request_headers.setdefault("content-type", content_type)
-
-            record: dict[str, Any] = {"method": method, "url": url}
-            try:
-                remaining_ms = int(max(1000, (deadline - time.monotonic()) * 1000))
-                timeout_ms = min(per_request_timeout_ms, remaining_ms)
-                kwargs: dict[str, Any] = {
-                    "method": method,
-                    "headers": request_headers,
-                    "timeout": timeout_ms,
-                    "fail_on_status_code": False,
-                }
-                if method not in {"GET", "HEAD"} and post_data not in (None, ""):
-                    kwargs["data"] = post_data
-                response = context.request.fetch(url, **kwargs)
-                record["status"] = response.status
-                response_headers = {str(k).lower(): str(v) for k, v in (response.headers or {}).items()}
-                record["content_type"] = response_headers.get("content-type", "")
-                if response.status >= 400:
-                    attempts.append(record)
-                    continue
-                body = response.body()
-                if len(body) > 3_000_000:
-                    record["skipped"] = f"body too large: {len(body)}"
-                    attempts.append(record)
-                    continue
-                try:
-                    text = body.decode("utf-8", errors="replace")
-                except Exception:
-                    text = body.decode("latin-1", errors="replace")
-                found_links, found_available = self._extract_document_data_from_text(text, url, base_url)
-                available.update(found_available)
-                for name, href in found_links.items():
-                    if href and not links.get(name):
-                        links[name] = href
-                record["found"] = sorted(found_available)
-                record["body_chars"] = len(text)
-            except Exception as exc:
-                record["error"] = shorten(str(exc), 350)
-            attempts.append(record)
-
-        if available:
-            LOGGER.info("Toronto document API replay found: %s", ", ".join(sorted(available)))
-        return links, available, {
-            "attempts": attempts,
-            "found": sorted(available),
-            "candidate_count": len(candidates),
-            "time_limit_seconds": total_seconds,
-        }
 
     def _document_scopes(self, page: Any) -> list[Any]:
         """Return the main page plus a bounded set of non-analytics child frames.
@@ -1647,98 +1638,53 @@ class TorontoOpenDataMonitor:
         LOGGER.info("Toronto Supporting Documentation mount probe final: %s", best)
         return best
 
-    def _expand_supporting_documentation(self, page: Any) -> None:
-        """Open the Supporting Documentation accordion without toggling it closed.
+    def _expand_supporting_documentation(self, page: Any) -> dict[str, Any]:
+        """Open only Supporting Documentation and verify its resulting state."""
+        for attempt in range(1, 4):
+            state = self._supporting_documentation_state(page)
+            if state.get("open"):
+                return state
 
-        Earlier versions clicked every text match for "Supporting Documentation",
-        which could expand and then immediately collapse the section. This version
-        checks for document rows after each action and only clicks a small number
-        of likely collapsed controls.
-        """
-        def count_rows() -> int:
+            clicked = self._click_supporting_docs_with_playwright_locators(page)
+            LOGGER.info(
+                "Toronto Supporting Documentation targeted click attempt %d: clicked=%d",
+                attempt,
+                clicked,
+            )
             try:
-                return sum(self._document_row_count(scope) for scope in self._document_scopes(page))
-            except Exception:
-                return 0
-
-        if count_rows() > 0:
-            return
-
-        self._click_supporting_docs_with_playwright_locators(page)
-        if count_rows() > 0:
-            return
-
-        click_js = r"""
-        (mode) => {
-            const visible = (el) => {
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-            };
-            const textOf = (el) => (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-            const controls = Array.from(document.querySelectorAll('button, a, [role="button"], summary, h2, h3, h4, .accordion-header, .accordion-button'));
-            const candidates = [];
-            for (const el of controls) {
-                if (!visible(el)) continue;
-                const text = textOf(el);
-                if (!text) continue;
-                const isExpandAll = /expand\s+all/i.test(text);
-                const isSupporting = /supporting\s+doc/i.test(text);
-                if (mode === 'expandAll' && isExpandAll) candidates.push(el);
-                if (mode === 'supporting' && isSupporting) {
-                    const expanded = (el.getAttribute('aria-expanded') || '').toLowerCase();
-                    const cls = el.className ? String(el.className).toLowerCase() : '';
-                    // Click if it explicitly says collapsed/false, or if no state
-                    // is exposed and we still have no rows.
-                    if (expanded !== 'true' || /collapsed/.test(cls)) candidates.push(el);
-                }
-            }
-            let clicked = 0;
-            for (const el of candidates.slice(0, mode === 'expandAll' ? 2 : 3)) {
-                try {
-                    el.scrollIntoView({block: 'center', inline: 'center'});
-                    el.click();
-                    clicked++;
-                } catch (e) {}
-            }
-            return clicked;
-        }
-        """
-
-        for mode in ("expandAll", "supporting"):
-            clicked_total = 0
-            for scope in self._document_scopes(page):
-                try:
-                    clicked_total += int(scope.evaluate(click_js, mode) or 0)
-                except Exception:
-                    continue
-            try:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(1200)
             except Exception:
                 pass
-            rows = count_rows()
-            LOGGER.info("Toronto Supporting Documentation expand step %s: clicked=%s rows=%s", mode, clicked_total, rows)
-            if rows > 0:
-                return
 
-        # Final attempt for accordion variants whose clickable control is a wrapper
-        # rather than the visible text node.
-        self._click_supporting_docs_with_playwright_locators(page)
-        self._force_supporting_docs_visible(page)
+            state = self._supporting_documentation_state(page)
+            if state.get("open"):
+                return state
 
-        # Final short wait for late-rendered Angular/DataTables content.
-        try:
-            page.wait_for_timeout(1500)
-        except Exception:
-            pass
+            # Continue progressive scrolling so a lazily mounted lower panel can
+            # initialize before the next exact targeted click.
+            for scope in self._document_scopes(page):
+                try:
+                    scope.evaluate(
+                        """() => {
+                            const root = document.scrollingElement || document.documentElement || document.body;
+                            if (root) root.scrollTop = Math.min(root.scrollHeight, (root.scrollTop || 0) + 900);
+                            window.scrollBy(0, 900);
+                        }"""
+                    )
+                except Exception:
+                    continue
 
-    def _click_supporting_docs_with_playwright_locators(self, page: Any) -> int:
-        """Open likely Supporting Documentation controls in one bounded DOM pass.
+        return self._supporting_documentation_state(page)
 
-        The old implementation performed up to dozens of locator operations, each
-        with an independent timeout. On a page without the expected controls that
-        could consume minutes. A single evaluate call per stable scope is enough.
-        """
+    def _supporting_documentation_state(self, page: Any) -> dict[str, Any]:
+        """Return whether the targeted accordion exists and is genuinely open."""
+        totals = {
+            "found": False,
+            "expanded": False,
+            "empty": False,
+            "visible_rows": 0,
+            "open": False,
+        }
         js = r"""
         () => {
             const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -1746,7 +1692,8 @@ class TorontoOpenDataMonitor:
                 try {
                     const style = window.getComputedStyle(el);
                     const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && rect.width > 0 && rect.height > 0;
                 } catch (e) { return false; }
             };
             const roots = [];
@@ -1759,24 +1706,144 @@ class TorontoOpenDataMonitor:
                 for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
             };
             addRoot(document);
-            const controls = [];
+
+            let found = false;
+            let expanded = false;
+            let empty = false;
+            let visibleRows = 0;
+
             for (const root of roots) {
+                let rows = [];
+                try {
+                    rows = Array.from(root.querySelectorAll(
+                        'tr:has(button.downloadFile[data-id]), tr:has(.downloadFile[data-id]), '
+                        + '[role="row"]:has(button.downloadFile[data-id]), [role="row"]:has(.downloadFile[data-id])'
+                    ));
+                } catch (e) { rows = []; }
+                visibleRows += rows.filter(visible).length;
+
+                let controls = [];
+                try {
+                    controls = Array.from(root.querySelectorAll(
+                        'button, a, summary, [role="button"], [aria-controls], .accordion-button, .accordion-header'
+                    ));
+                } catch (e) { controls = []; }
+                for (const control of controls) {
+                    const text = clean(control.innerText || control.textContent || control.getAttribute('aria-label') || '');
+                    if (!/\bSupporting Documentation\b/i.test(text)) continue;
+                    found = true;
+                    const aria = clean(control.getAttribute('aria-expanded')).toLowerCase();
+                    const cls = clean(control.className).toLowerCase();
+                    if (aria === 'true' && !/collapsed/.test(cls)) expanded = true;
+                    const panelId = clean(control.getAttribute('aria-controls'));
+                    if (panelId) {
+                        try {
+                            const panel = root.getElementById ? root.getElementById(panelId) : root.querySelector(`[id="${CSS.escape(panelId)}"]`);
+                            if (panel && visible(panel)) {
+                                expanded = true;
+                                const panelText = clean(panel.innerText || panel.textContent || '');
+                                if (/No data available|No matching records|No supporting documents|0 entries/i.test(panelText)) empty = true;
+                            }
+                        } catch (e) {}
+                    }
+                }
+
+                let bodyText = '';
+                try { bodyText = clean(root.innerText || root.textContent || ''); } catch (e) {}
+                if (/Supporting Documentation/i.test(bodyText)
+                    && /No data available|No matching records|No supporting documents/i.test(bodyText)) {
+                    empty = true;
+                }
+            }
+            return {
+                found,
+                expanded,
+                empty,
+                visible_rows: visibleRows,
+                open: visibleRows > 0 || expanded || (found && empty),
+            };
+        }
+        """
+        for scope in self._document_scopes(page):
+            try:
+                result = scope.evaluate(js) or {}
+            except Exception:
+                continue
+            totals["found"] = bool(totals["found"] or result.get("found"))
+            totals["expanded"] = bool(totals["expanded"] or result.get("expanded"))
+            totals["empty"] = bool(totals["empty"] or result.get("empty"))
+            totals["visible_rows"] += int(result.get("visible_rows") or 0)
+
+        totals["open"] = bool(
+            totals["visible_rows"] > 0
+            or totals["expanded"]
+            or (totals["found"] and totals["empty"])
+        )
+        return totals
+
+    def _click_supporting_docs_with_playwright_locators(self, page: Any) -> int:
+        """Click one actionable Supporting Documentation control per scope.
+
+        Page-wide ``Expand All`` is intentionally excluded because Toronto can
+        expand every other table while leaving Supporting Documentation closed.
+        """
+        js = r"""
+        () => {
+            const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const visible = el => {
+                try {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && rect.width > 0 && rect.height > 0;
+                } catch (e) { return false; }
+            };
+            const roots = [];
+            const seenRoots = new Set();
+            const addRoot = root => {
+                if (!root || seenRoots.has(root)) return;
+                seenRoots.add(root); roots.push(root);
                 let nodes = [];
-                try { nodes = Array.from(root.querySelectorAll('button, a, [role="button"], summary, h2, h3, h4, .accordion-header, .accordion-button')); } catch (e) { nodes = []; }
-                controls.push(...nodes);
+                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+            };
+            addRoot(document);
+
+            for (const root of roots) {
+                let labels = [];
+                try {
+                    labels = Array.from(root.querySelectorAll(
+                        'button, a, summary, [role="button"], [aria-controls], .accordion-button, .accordion-header, h2, h3, h4'
+                    ));
+                } catch (e) { labels = []; }
+                for (const label of labels) {
+                    const text = clean(label.innerText || label.textContent || label.getAttribute('aria-label') || '');
+                    if (!/\bSupporting Documentation\b/i.test(text) || /Expand All/i.test(text)) continue;
+
+                    let target = label;
+                    if (!/^(BUTTON|A|SUMMARY)$/i.test(target.tagName || '')
+                        && clean(target.getAttribute('role')).toLowerCase() !== 'button') {
+                        const nested = target.querySelector && target.querySelector(
+                            'button, a, summary, [role="button"], [aria-controls]'
+                        );
+                        if (nested) target = nested;
+                        else if (target.closest) {
+                            const ancestor = target.closest(
+                                'button, a, summary, [role="button"], [aria-controls]'
+                            );
+                            if (ancestor) target = ancestor;
+                        }
+                    }
+
+                    const expanded = clean(target.getAttribute('aria-expanded')).toLowerCase();
+                    const cls = clean(target.className).toLowerCase();
+                    if (expanded === 'true' && !/collapsed/.test(cls)) return 0;
+                    if (!visible(target) && !visible(label)) continue;
+                    try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+                    try { target.click(); return 1; } catch (e) {}
+                }
             }
-            const ranked = controls
-                .filter(visible)
-                .map(el => ({el, text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || '')}))
-                .filter(x => /^(Expand\s+All|Supporting\s+Documentation)$/i.test(x.text) || /Supporting\s+Documentation/i.test(x.text))
-                .sort((a, b) => (/Supporting/i.test(a.text) ? -1 : 1));
-            let clicked = 0;
-            for (const item of ranked.slice(0, 3)) {
-                const expanded = String(item.el.getAttribute('aria-expanded') || '').toLowerCase();
-                if (expanded === 'true' && /Supporting/i.test(item.text)) continue;
-                try { item.el.scrollIntoView({block: 'center'}); item.el.click(); clicked++; } catch (e) {}
-            }
-            return clicked;
+            return 0;
         }
         """
         clicked_total = 0
@@ -1785,122 +1852,13 @@ class TorontoOpenDataMonitor:
                 clicked_total += int(scope.evaluate(js) or 0)
             except Exception:
                 continue
-        if clicked_total:
-            LOGGER.info("Toronto Supporting Documentation bounded click attempts: %s", clicked_total)
         return clicked_total
 
     def _force_supporting_docs_visible(self, page: Any) -> None:
-        """Aggressively open the Supporting Documentation UI.
-
-        Uses both Playwright locators and a JS deep traversal that walks open
-        shadow roots. This matters because the City page can render the AIC app
-        under component roots where plain document.querySelectorAll() sees only
-        the outer shell.
-        """
+        """Compatibility helper that performs only the safe targeted click."""
         self._click_supporting_docs_with_playwright_locators(page)
-        js = r"""
-        () => {
-            const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-            const roots = () => {
-                const out = [];
-                const seen = new Set();
-                const addRoot = root => {
-                    if (!root || seen.has(root)) return;
-                    seen.add(root);
-                    out.push(root);
-                    let nodes = [];
-                    try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
-                    for (const node of nodes) {
-                        if (node.shadowRoot) addRoot(node.shadowRoot);
-                    }
-                };
-                addRoot(document);
-                return out;
-            };
-            const allDeep = selector => {
-                const out = [];
-                const seen = new Set();
-                for (const root of roots()) {
-                    let nodes = [];
-                    try { nodes = Array.from(root.querySelectorAll(selector)); } catch (e) { nodes = []; }
-                    for (const node of nodes) {
-                        if (!seen.has(node)) { seen.add(node); out.push(node); }
-                    }
-                }
-                return out;
-            };
-            const visible = el => {
-                try {
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                } catch (e) { return false; }
-            };
-            const rowReady = () => allDeep('tr, [role="row"]').some(tr => {
-                const text = clean(tr.innerText || tr.textContent || '');
-                return /Application Form|Architectural|Civil|Geotechnical|Hydrogeological/i.test(text)
-                    && (tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id], button, a')
-                        || allDeep('button.downloadFile[data-id], .downloadFile[data-id]').some(btn => tr.contains(btn)));
-            });
-            const dispatchClick = el => {
-                if (!el) return false;
-                try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
-                for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-                    try { el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window})); } catch (e) {}
-                }
-                try { el.click(); } catch (e) {}
-                return true;
-            };
-
-            let clicked = 0;
-            const controls = allDeep('button, a, [role="button"], summary, h1, h2, h3, h4, h5, .accordion-header, .accordion-button, [aria-controls], [data-toggle], [data-bs-toggle]');
-            for (const el of controls) {
-                if (clicked >= 20 || rowReady()) break;
-                const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
-                if (!/Expand All|Supporting Documentation/i.test(text)) continue;
-                let target = el;
-                for (let depth = 0, cur = el; cur && depth < 5; depth++, cur = cur.parentElement) {
-                    const role = (cur.getAttribute && (cur.getAttribute('role') || '')).toLowerCase();
-                    const aria = (cur.getAttribute && (cur.getAttribute('aria-controls') || cur.getAttribute('data-target') || cur.getAttribute('data-bs-target') || '')).toLowerCase();
-                    const cls = String(cur.className || '').toLowerCase();
-                    if (cur.tagName && /^(BUTTON|A|SUMMARY)$/i.test(cur.tagName)) { target = cur; break; }
-                    if (role === 'button' || aria || /accordion|collapse|header|toggle|btn/.test(cls)) { target = cur; break; }
-                }
-                if (visible(target) || visible(el)) {
-                    if (dispatchClick(target)) { clicked++; }
-                }
-            }
-
-            for (const el of allDeep('[hidden]')) {
-                const text = clean(el.innerText || el.textContent || '');
-                if (/Supporting Documentation|Reference File|Application Form|Download/i.test(text)) {
-                    try { el.hidden = false; el.removeAttribute('hidden'); } catch (e) {}
-                }
-            }
-            for (const el of allDeep('.collapse, .collapsed, [aria-expanded="false"], [style*="display: none"], [style*="visibility: hidden"]')) {
-                const text = clean(el.innerText || el.textContent || '');
-                if (/Supporting Documentation|Reference File|Application Form|Download/i.test(text)) {
-                    try { el.classList.add('show'); el.classList.remove('collapsed'); } catch (e) {}
-                    try { el.setAttribute('aria-expanded', 'true'); } catch (e) {}
-                    try { el.style.display = 'block'; el.style.height = 'auto'; el.style.visibility = 'visible'; el.style.opacity = '1'; } catch (e) {}
-                }
-            }
-            return {
-                clicked,
-                hasRows: rowReady(),
-                downloadButtons: allDeep('button.downloadFile[data-id], .downloadFile[data-id]').length,
-                supportingTextMatches: allDeep('body *').filter(el => /Supporting Documentation/i.test(clean(el.innerText || el.textContent || ''))).length
-            };
-        }
-        """
-        for scope in self._document_scopes(page):
-            try:
-                result = scope.evaluate(js)
-                LOGGER.info("Toronto Supporting Documentation force-visible step: %s", result)
-            except Exception:
-                continue
         try:
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(900)
         except Exception:
             pass
 
@@ -1959,37 +1917,6 @@ class TorontoOpenDataMonitor:
         )
         return best_links, best_available
 
-    def _document_row_count(self, scope: Any) -> int:
-        try:
-            return int(
-                scope.evaluate(
-                    r"""
-                    () => {
-                        const roots = [];
-                        const seenRoots = new Set();
-                        const addRoot = root => {
-                            if (!root || seenRoots.has(root)) return;
-                            seenRoots.add(root);
-                            roots.push(root);
-                            let nodes = [];
-                            try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
-                            for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
-                        };
-                        addRoot(document);
-                        const rows = [];
-                        const seen = new Set();
-                        for (const root of roots) {
-                            let found = [];
-                            try { found = Array.from(root.querySelectorAll('table tbody tr, table tr, tr, [role="row"]')); } catch (e) { found = []; }
-                            for (const row of found) if (!seen.has(row)) { seen.add(row); rows.push(row); }
-                        }
-                        return rows.filter(tr => /Download|Reference File|Application Form|Architectural|Civil|Geotechnical|Hydro/i.test(tr.innerText || tr.textContent || '')).length;
-                    }
-                    """
-                )
-            )
-        except Exception:
-            return 0
 
     def _install_toronto_network_recorder(self, page: Any) -> dict[str, Any]:
         """Record bounded request and response metadata for safe API replay."""
@@ -2068,37 +1995,8 @@ class TorontoOpenDataMonitor:
             return True
         return bool(re.search(r"\.(pdf|zip|docx?|xlsx?)(?:\?|$)", lowered_url))
 
-    def _extract_network_document_data(self, recorder: dict[str, Any], base_url: str) -> tuple[dict[str, str], set[str]]:
-        """Map direct download responses by URL or Content-Disposition filename."""
-        links: dict[str, str] = {}
-        available: set[str] = set()
-        for item in recorder.get("responses", [])[:400]:
-            if not isinstance(item, dict):
-                continue
-            url = normalize_key(item.get("url"))
-            headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
-            disposition = html.unescape(normalize_key(headers.get("content-disposition", "")))
-            label = f"{url} {disposition}"
-            name = self._document_name_for_text(label)
-            if not name:
-                continue
-            available.add(name)
-            if self._response_looks_like_download(url, headers) and self._is_meaningful_document_url(url, base_url):
-                links.setdefault(name, url)
-        return links, available
 
-    def _download_button_fallback_url(self, base_url: str, document_name: str, data_id: str = "") -> str:
-        """Return the application page's Supporting Documentation anchor.
 
-        ``button.downloadFile[data-id]`` contains an opaque UI token, not a
-        reusable URL.  Never serialize it as a pseudo download link.  The
-        caller may still use this page anchor as a manual navigation fallback.
-        """
-        return self._supporting_docs_anchor(base_url)
-
-    def _extract_download_button_document_rows_with_locators(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str], int, int]:
-        """Deprecated compatibility wrapper; bulk bounded JS extraction is used."""
-        return {}, set(), 0, 0
 
     def _extract_download_button_document_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
         """Read Supporting Documentation rows in one bounded operation per scope.
@@ -2246,111 +2144,9 @@ class TorontoOpenDataMonitor:
         )
         return links, available
 
-    def _extract_document_data_from_text(self, body_text: str, source_url: str, base_url: str) -> tuple[dict[str, str], set[str]]:
-        links: dict[str, str] = {}
-        available: set[str] = set()
-        text_sample = body_text[:2_500_000]
 
-        looks_like_document_table = bool(re.search(r"Reference\s+File|Supporting\s+Documentation|\bDownload\b", text_sample, re.I))
-        if looks_like_document_table:
-            for name, patterns in self.REQUIRED_DOCUMENTS.items():
-                if any(re.search(pattern, text_sample, flags=re.I) for pattern in patterns):
-                    available.add(name)
 
-        if "<" in text_sample and ("Download" in text_sample or "Reference File" in text_sample or "href" in text_sample):
-            try:
-                html_links = self._extract_document_links(text_sample, base_url)
-                for name, href in html_links.items():
-                    if href and self._is_meaningful_document_url(href, base_url):
-                        links[name] = href
-                        available.add(name)
-            except Exception:
-                pass
 
-        try:
-            data = json.loads(text_sample)
-        except Exception:
-            data = None
-
-        if data is not None:
-            self._walk_document_json(data, source_url, base_url, links, available)
-
-        return links, available
-
-    def _walk_document_json(
-        self,
-        obj: Any,
-        source_url: str,
-        base_url: str,
-        links: dict[str, str],
-        available: set[str],
-        depth: int = 0,
-    ) -> None:
-        if depth > 8:
-            return
-
-        if isinstance(obj, dict):
-            scalar_values: list[str] = []
-            for key, value in obj.items():
-                if isinstance(value, (str, int, float, bool)) or value is None:
-                    scalar_values.append(f"{key}: {value}")
-            combined = normalize_key(" ".join(scalar_values))
-            doc_name = self._document_name_for_text(combined)
-            if doc_name:
-                available.add(doc_name)
-                for candidate in self._json_url_candidates(obj, source_url, base_url):
-                    if self._is_meaningful_document_url(candidate, base_url):
-                        links.setdefault(doc_name, candidate)
-                        break
-
-            for value in obj.values():
-                self._walk_document_json(value, source_url, base_url, links, available, depth + 1)
-            return
-
-        if isinstance(obj, list):
-            for value in obj[:300]:
-                self._walk_document_json(value, source_url, base_url, links, available, depth + 1)
-            return
-
-        if isinstance(obj, str):
-            doc_name = self._document_name_for_text(obj)
-            if doc_name:
-                available.add(doc_name)
-                if "<" in obj or "http" in obj or "/" in obj:
-                    found_links, found_available = self._extract_document_data_from_text(obj, source_url, base_url)
-                    available.update(found_available)
-                    for name, href in found_links.items():
-                        links.setdefault(name, href)
-
-    def _json_url_candidates(self, obj: dict[str, Any], source_url: str, base_url: str) -> list[str]:
-        candidates: list[str] = []
-
-        def add(value: Any) -> None:
-            raw = html.unescape(str(value or "")).strip()
-            if not raw:
-                return
-            pieces: list[str] = []
-            pieces.extend(re.findall(r"https?://[^\s'\"<>\\)]+", raw, flags=re.I))
-            pieces.extend(re.findall(r"(?<![A-Za-z0-9])(/[^\s'\"<>\\)]+)", raw))
-            if not pieces and re.search(r"\.(?:pdf|zip|docx?|xlsx?)(?:\?|$)|download|document|attachment|file", raw, re.I):
-                pieces.append(raw)
-            for piece in pieces:
-                full_url = urljoin(base_url or source_url, normalize_key(piece))
-                if full_url and full_url not in candidates:
-                    candidates.append(full_url)
-
-        for key, value in obj.items():
-            key_lower = str(key).lower()
-            if any(token in key_lower for token in ("url", "href", "link", "download", "document", "attachment", "file", "path")):
-                add(value)
-            elif isinstance(value, str) and re.search(r"https?://|/.*(?:download|document|attachment|file)|\.(?:pdf|zip|docx?|xlsx?)(?:\?|$)", value, re.I):
-                add(value)
-
-        return candidates
-
-    def _set_document_table_to_all_rows_with_locators(self, scope: Any, search_term: str = "") -> None:
-        """Compatibility wrapper; table manipulation is now performed in one JS call."""
-        return None
 
     def _set_document_table_to_all_rows(self, scope: Any, search_term: str = "") -> None:
         """Search and expand only tables that look like Supporting Documentation."""
@@ -2400,93 +2196,7 @@ class TorontoOpenDataMonitor:
         except Exception:
             pass
 
-    def _row_url_candidates(self, row: Any, base_url: str) -> list[str]:
-        try:
-            raw_values = row.evaluate(
-                """
-                (row) => {
-                    const values = [];
-                    const add = (value) => {
-                        if (value !== undefined && value !== null && String(value).trim()) {
-                            values.push(String(value));
-                        }
-                    };
-                    const nodes = [row, ...row.querySelectorAll('a, button, input, [onclick], [href], [src], [formaction], [data-href], [data-url], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')];
-                    for (const node of nodes) {
-                        if (!node.getAttributeNames) continue;
-                        for (const attr of node.getAttributeNames()) {
-                            const lower = attr.toLowerCase();
-                            if (['href', 'src', 'formaction', 'onclick'].includes(lower) || lower.startsWith('data')) {
-                                add(node.getAttribute(attr));
-                            }
-                        }
-                    }
-                    return values;
-                }
-                """
-            )
-        except Exception:
-            raw_values = []
 
-        candidates: list[str] = []
-        for value in raw_values or []:
-            raw = html.unescape(str(value or "")).strip()
-            if not raw:
-                continue
-            pieces: list[str] = []
-            pieces.extend(re.findall(r"https?://[^\s'\"<>\\)]+", raw, flags=re.I))
-            pieces.extend(re.findall(r"(?<![A-Za-z0-9])(/[^\s'\"<>\\)]+)", raw))
-            pieces.extend(
-                re.findall(
-                    r"['\"]([^'\"]*(?:download|document|attachment|file)[^'\"]*)['\"]",
-                    raw,
-                    flags=re.I,
-                )
-            )
-            if not pieces:
-                lowered = raw.lower()
-                if not lowered.startswith(("javascript:", "mailto:", "tel:", "#", "blob:")) and (
-                    "/" in raw or "download" in lowered or "document" in lowered or "file" in lowered or "attachment" in lowered
-                ):
-                    pieces.append(raw)
-            for piece in pieces:
-                full_url = urljoin(base_url, normalize_key(piece))
-                if self._is_meaningful_document_url(full_url, base_url) and full_url not in candidates:
-                    candidates.append(full_url)
-        return candidates
-
-    def _visible_document_rows(self, scope: Any, required_name: str) -> list[Any]:
-        rows: list[Any] = []
-        selectors = "table tbody tr, table tr, tr, [role='row']"
-        try:
-            locator = scope.locator(selectors)
-            count = min(locator.count(), 500)
-        except Exception:
-            return rows
-
-        for index in range(count):
-            row = locator.nth(index)
-            try:
-                text = normalize_key(row.inner_text(timeout=1200))
-            except Exception:
-                try:
-                    text = normalize_key(row.text_content(timeout=1200))
-                except Exception:
-                    continue
-            if not text or "no matching records" in text.lower():
-                continue
-
-            first_cell = ""
-            try:
-                cells = row.locator("td")
-                if cells.count() > 0:
-                    first_cell = normalize_key(cells.first.inner_text(timeout=800))
-            except Exception:
-                first_cell = ""
-
-            if (self._document_name_for_text(first_cell) or self._document_name_for_text(text)) == required_name:
-                rows.append(row)
-        return rows
 
     def _document_names_visible_on_page(self, page: Any) -> set[str]:
         names: set[str] = set()
@@ -2530,254 +2240,7 @@ class TorontoOpenDataMonitor:
                     names.add(name)
         return names
 
-    def _click_row_download_for_url(self, page: Any, row: Any, base_url: str, required_name: str) -> str:
-        downloads: list[Any] = []
-        popups: list[Any] = []
-        opened_urls: list[str] = []
-        response_candidates: list[str] = []
-        request_candidates: list[str] = []
 
-        def useful_url(candidate: str | None) -> str:
-            candidate = normalize_key(candidate)
-            if not candidate:
-                return ""
-            full_url = urljoin(base_url, candidate)
-            return full_url if self._is_meaningful_document_url(full_url, base_url) else ""
-
-        def on_download(download: Any) -> None:
-            downloads.append(download)
-
-        def on_popup(popup: Any) -> None:
-            popups.append(popup)
-
-        def on_request(request: Any) -> None:
-            try:
-                request_url = normalize_key(request.url)
-                resource_type = normalize_key(getattr(request, "resource_type", "")).lower()
-                method = normalize_key(getattr(request, "method", "")).upper()
-            except Exception:
-                return
-            if self._is_static_asset_url(request_url):
-                return
-            lowered = request_url.lower()
-            if resource_type in {"xhr", "fetch", "document"} or method == "POST" or any(
-                token in lowered for token in ("download", "document", "attachment", "file", "aic", "application", "folder")
-            ):
-                request_candidates.append(request_url)
-
-        def on_response(response: Any) -> None:
-            try:
-                response_url = normalize_key(response.url)
-                headers = {k.lower(): v for k, v in (response.headers or {}).items()}
-            except Exception:
-                return
-            if self._is_static_asset_url(response_url):
-                return
-            if self._response_looks_like_download(response_url, headers):
-                response_candidates.append(response_url)
-                return
-            lowered = response_url.lower()
-            if any(token in lowered for token in ("download", "document", "attachment", "file")):
-                response_candidates.append(response_url)
-
-        try:
-            page.on("download", on_download)
-            page.on("popup", on_popup)
-            page.on("request", on_request)
-            page.on("response", on_response)
-        except Exception:
-            pass
-
-        before_url = page.url
-        try:
-            try:
-                page.evaluate(
-                    """
-                    () => {
-                        if (!window.__torontoCapturedOpenInstalled) {
-                            window.__torontoCapturedOpenInstalled = true;
-                            window.__torontoCapturedOpens = [];
-                            const originalOpen = window.open;
-                            window.open = function(url, ...args) {
-                                try { window.__torontoCapturedOpens.push(String(url || '')); } catch (e) {}
-                                if (originalOpen) return originalOpen.call(window, url, ...args);
-                                return null;
-                            };
-                        } else {
-                            window.__torontoCapturedOpens = [];
-                        }
-                    }
-                    """
-                )
-            except Exception:
-                pass
-
-            control = row.locator("a:has-text('Download'), button:has-text('Download'), input[value*='Download' i]").first
-            try:
-                if control.count() == 0:
-                    control = row.locator("a, button, input[type='button'], input[type='submit'], [role='button']").first
-            except Exception:
-                pass
-
-            clicked = False
-            try:
-                control.scroll_into_view_if_needed(timeout=3000)
-            except Exception:
-                pass
-
-            try:
-                with page.expect_download(timeout=6000) as download_info:
-                    control.click(timeout=5000, no_wait_after=True, force=True)
-                    clicked = True
-                download = download_info.value
-                candidate = useful_url(getattr(download, "url", ""))
-                try:
-                    download.cancel()
-                except Exception:
-                    pass
-                if candidate:
-                    return candidate
-            except Exception:
-                if not clicked:
-                    try:
-                        control.click(timeout=5000, no_wait_after=True, force=True)
-                        clicked = True
-                    except Exception as exc:
-                        LOGGER.info("Could not click %s document download button: %s", required_name, exc)
-                        return ""
-
-            page.wait_for_timeout(3000)
-
-            for download in reversed(downloads):
-                candidate = useful_url(getattr(download, "url", ""))
-                try:
-                    download.cancel()
-                except Exception:
-                    pass
-                if candidate:
-                    return candidate
-
-            for popup in reversed(popups):
-                try:
-                    popup.wait_for_load_state("domcontentloaded", timeout=3000)
-                except Exception:
-                    pass
-                candidate = useful_url(getattr(popup, "url", ""))
-                try:
-                    popup.close()
-                except Exception:
-                    pass
-                if candidate:
-                    return candidate
-
-            try:
-                opened_urls = page.evaluate("window.__torontoCapturedOpens || []") or []
-            except Exception:
-                opened_urls = []
-            for candidate in reversed(opened_urls):
-                candidate = useful_url(candidate)
-                if candidate:
-                    return candidate
-
-            candidate = useful_url(page.url)
-            if candidate and candidate != before_url:
-                try:
-                    page.go_back(wait_until="domcontentloaded", timeout=5000)
-                    page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-                return candidate
-
-            for candidate in reversed(response_candidates):
-                candidate = useful_url(candidate)
-                if candidate:
-                    return candidate
-
-            # Last click-level fallback: if the click produced exactly one non-static XHR/POST,
-            # return it. This catches city endpoints that stream a file without helpful headers.
-            unique_requests = []
-            for candidate in request_candidates:
-                candidate = useful_url(candidate)
-                if candidate and candidate not in unique_requests:
-                    unique_requests.append(candidate)
-            if len(unique_requests) == 1:
-                return unique_requests[0]
-        finally:
-            try:
-                page.remove_listener("download", on_download)
-                page.remove_listener("popup", on_popup)
-                page.remove_listener("request", on_request)
-                page.remove_listener("response", on_response)
-            except Exception:
-                pass
-
-        return ""
-
-    def _capture_document_download_links(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
-        """Capture URLs hidden behind Toronto's JavaScript Download buttons."""
-        captured: dict[str, str] = {}
-        available: set[str] = set()
-        search_terms = {
-            "Application Form": ["Application Form", "Application"],
-            "Architectural Plans": ["Architectural Plans", "Architectural", "Elevations", "Floor Plans"],
-            "Civil and Utilities Plans": ["Civil and Utilities Plans", "Utilities", "Civil", "Servicing", "Grading", "Stormwater"],
-            "Geotechnical Study": ["Geotechnical Study", "Geotechnical", "Geo-tech", "Soil"],
-            "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater", "Dewatering"],
-        }
-
-        scopes = self._document_scopes(page)
-        for scope in scopes:
-            try:
-                self._set_document_table_to_all_rows(scope)
-            except Exception:
-                pass
-
-        for required_name in self.REQUIRED_DOCUMENTS:
-            rows: list[Any] = []
-            for scope in scopes:
-                rows.extend(self._visible_document_rows(scope, required_name))
-            if not rows:
-                for term in search_terms.get(required_name, [required_name]):
-                    for scope in scopes:
-                        try:
-                            self._set_document_table_to_all_rows(scope, term)
-                        except Exception:
-                            continue
-                    rows = []
-                    for scope in scopes:
-                        rows.extend(self._visible_document_rows(scope, required_name))
-                    if rows:
-                        break
-
-            if rows:
-                available.add(required_name)
-
-            for row in rows[:3]:
-                for candidate in self._row_url_candidates(row, base_url):
-                    if candidate:
-                        captured[required_name] = candidate
-                        break
-                if captured.get(required_name):
-                    break
-
-                clicked_url = self._click_row_download_for_url(page, row, base_url, required_name)
-                if clicked_url:
-                    captured[required_name] = clicked_url
-                    break
-
-            for scope in scopes:
-                try:
-                    self._set_document_table_to_all_rows(scope)
-                except Exception:
-                    pass
-
-        if captured:
-            LOGGER.info("Captured %d Toronto direct document link(s) for %s: %s", len(captured), base_url, ", ".join(sorted(captured)))
-        if available:
-            LOGGER.info("Detected %d Toronto required document row(s) for %s: %s", len(available), base_url, ", ".join(sorted(available)))
-        if not captured and not available:
-            LOGGER.info("No Toronto Supporting Documentation rows or direct document links captured for %s", base_url)
-        return captured, available
 
     def _extract_application_form_text_from_page(self, page: Any, base_url: str) -> str:
         """Download the Application Form once, without scanning hundreds of rows."""
@@ -3063,108 +2526,78 @@ class TorontoOpenDataMonitor:
         return any(marker in page_text for marker in markers)
 
     def _extract_document_links(self, html_text: str, base_url: str) -> dict[str, str]:
-        """Extract required links from the rendered Supporting Documentation table."""
+        """Extract safe direct links or explicit application-page availability."""
         soup = BeautifulSoup(html_text or "", "html.parser")
         docs = {name: "" for name in self.REQUIRED_DOCUMENTS}
 
-        def maybe_capture(label_text: str, href: str) -> None:
-            text = normalize_key(label_text)
-            href = normalize_key(href)
-            if not text or not href:
-                return
+        def document_name(text: Any) -> str:
+            return self._document_name_for_text(normalize_key(text))
 
-            lowered = f"{text} {href}".lower()
-            full_url = urljoin(base_url, href)
+        # Synthetic rows produced by _download_links_fixture_html are trusted
+        # because they distinguish a real direct URL from row availability.
+        for row in soup.select("tr[data-captured-document]"):
+            name = document_name(row.get_text(" ", strip=True))
+            link = row.find("a", href=True)
+            if not name or not link:
+                continue
+            href = urljoin(base_url, normalize_key(link.get("href")))
+            kind = normalize_key(row.get("data-captured-document")).lower()
+            if kind == "available-on-page":
+                parsed = urlparse(href)
+                if "toronto.ca" in parsed.netloc.lower() and "/application-details/" in parsed.path.lower():
+                    docs[name] = self._supporting_docs_anchor(href)
+            elif self._is_meaningful_document_url(href, base_url):
+                docs[name] = href
 
-            for name, patterns in self.REQUIRED_DOCUMENTS.items():
-                if docs.get(name):
-                    continue
-                if any(re.search(pattern, lowered, flags=re.I) for pattern in patterns):
-                    docs[name] = full_url
-
-        def element_context(element: Any) -> str:
+        def context_text(element: Any) -> str:
             pieces = [element.get_text(" ", strip=True)]
-            for parent_name in ("tr", "li"):
-                parent = element.find_parent(parent_name)
-                if parent:
-                    pieces.append(parent.get_text(" ", strip=True))
-                    break
-            return normalize_key(" ".join(dict.fromkeys(piece for piece in pieces if piece)))
+            parent = element.find_parent(["tr", "li"])
+            if parent:
+                pieces.append(parent.get_text(" ", strip=True))
+            return normalize_key(" ".join(piece for piece in pieces if piece))
 
-        def url_candidates(element: Any) -> list[str]:
-            candidates: list[str] = []
-
-            def add_from_text(value: Any, *, allow_raw: bool) -> None:
-                raw = html.unescape(str(value or "")).strip()
-                if not raw:
-                    return
-
-                found = False
-                for match in re.findall(r"https?://[^\s'\"<>\\)]+", raw, flags=re.I):
-                    candidates.append(match)
-                    found = True
-
-                for match in re.findall(r"(?<![A-Za-z0-9])(/[^\s'\"<>\\)]+)", raw):
-                    candidates.append(match)
-                    found = True
-
-                for match in re.findall(
-                    r"['\"]([^'\"]*(?:download|document|attachment|file)[^'\"]*)['\"]",
-                    raw,
-                    flags=re.I,
-                ):
-                    candidates.append(match)
-                    found = True
-
-                if allow_raw and not found:
-                    lowered = raw.lower()
-                    if not lowered.startswith(("javascript:", "mailto:", "tel:", "#")):
-                        if "/" in raw or "download" in lowered or "document" in lowered or "file" in lowered:
-                            candidates.append(raw)
-
+        def candidates(element: Any) -> list[str]:
+            values: list[str] = []
             nodes = [element]
             try:
                 nodes.extend(element.find_all(True))
             except Exception:
                 pass
-
             for node in nodes:
                 for attr_name, attr_value in getattr(node, "attrs", {}).items():
-                    attr_lower = attr_name.lower()
+                    attr_lower = str(attr_name).lower()
                     if attr_lower == "data-id":
-                        # Opaque City UI token: useful for proving the row has a
-                        # Download control, but never a retrievable URL.
                         continue
-                    if attr_lower in {"href", "src"} or attr_lower.startswith("data"):
-                        add_from_text(attr_value, allow_raw=True)
-                    elif attr_lower == "onclick":
-                        add_from_text(attr_value, allow_raw=False)
-
+                    if attr_lower in {
+                        "href", "src", "formaction", "data-href", "data-url",
+                        "data-download-url", "data-document-url", "data-file-url",
+                    }:
+                        if isinstance(attr_value, list):
+                            values.extend(str(value) for value in attr_value)
+                        else:
+                            values.append(str(attr_value))
             seen: set[str] = set()
-            unique: list[str] = []
-            for candidate in candidates:
-                candidate = normalize_key(candidate)
-                if candidate and candidate not in seen:
-                    seen.add(candidate)
-                    unique.append(candidate)
-            return unique
+            output: list[str] = []
+            for value in values:
+                value = normalize_key(html.unescape(value))
+                if value and value not in seen:
+                    seen.add(value)
+                    output.append(value)
+            return output
 
-        # Prefer full table-row context. Toronto's Action button says "Download",
-        # while the real document name is in the Reference File column.
-        for row in soup.select("table tbody tr, table tr"):
-            row_text = element_context(row)
-            for href in url_candidates(row):
-                maybe_capture(row_text, href)
-        # Normal anchors. In the Supporting Documentation table, the anchor
-        # text may be generic; the document name/type is often in sibling cells.
-        for link in soup.find_all("a", href=True):
-            maybe_capture(element_context(link), link.get("href"))
-
-        # Fallback for links/buttons outside a normal table row.
-        for element in soup.select("a[href], button, [onclick], [data-href], [data-url], [data-download-url], [data-file-url]"):
-            visible_text = element_context(element)
-            for href in url_candidates(element):
-                maybe_capture(visible_text, href)
+        # Normal rendered rows/links may only contribute genuine file endpoints.
+        for element in soup.select(
+            "table tbody tr, table tr, a[href], button, [formaction], "
+            "[data-href], [data-url], [data-download-url], [data-document-url], [data-file-url]"
+        ):
+            name = document_name(context_text(element))
+            if not name or docs.get(name):
+                continue
+            for candidate in candidates(element):
+                full_url = urljoin(base_url, candidate)
+                if self._is_meaningful_document_url(full_url, base_url):
+                    docs[name] = full_url
+                    break
 
         return docs
 
@@ -3549,6 +2982,15 @@ class TorontoOpenDataMonitor:
 
             item["detail_url"] = final_url or detail_url
             item["document_links"] = self._extract_document_links(html_text, item["detail_url"])
+            item["document_link_kind"] = {
+                name: (
+                    "application-page"
+                    if "/application-details/" in urlparse(normalize_key(value)).path.lower()
+                    else "direct"
+                )
+                for name, value in item["document_links"].items()
+                if normalize_key(value)
+            }
             found_docs = sum(1 for value in item["document_links"].values() if normalize_key(value))
             LOGGER.info(
                 "Toronto supporting docs extracted: %d/%d found for %s",
@@ -3563,7 +3005,11 @@ class TorontoOpenDataMonitor:
                 LOGGER.info("Toronto contact extraction succeeded from rendered Application Form for %s", item["detail_url"])
             else:
                 form_url = item["document_links"].get("Application Form")
-                fallback_contacts = self._extract_application_form_contacts(form_url) if form_url else self._empty_party_contacts()
+                fallback_contacts = (
+                    self._extract_application_form_contacts(form_url)
+                    if form_url and self._is_meaningful_document_url(form_url, item["detail_url"])
+                    else self._empty_party_contacts()
+                )
                 if self._contacts_have_content(fallback_contacts):
                     item.update(fallback_contacts)
                     LOGGER.info("Toronto contact extraction succeeded from direct Application Form URL for %s", item["detail_url"])
@@ -3576,7 +3022,7 @@ class TorontoOpenDataMonitor:
             )))
             if status_codes:
                 messages = {
-                    "widget-not-ready": "City application widget did not paint; document API fallback was used.",
+                    "widget-not-ready": "City application widget did not paint.",
                     "supporting-section-not-detected": "Supporting Documentation could not be confirmed.",
                     "application-form-contacts-not-extracted": "Application Form was detected, but owner/applicant fields were not extracted.",
                 }
@@ -4071,7 +3517,18 @@ class Notifier:
         ]
         lines = ["Document links:"]
         for name in required:
-            lines.append(f"  - {name}: {document_links.get(name) or 'Not found'}")
+            value = normalize_key((document_links or {}).get(name))
+            if not value:
+                lines.append(f"  - {name}: Not found")
+                continue
+            parsed = urlparse(value)
+            if "/application-details/" in parsed.path.lower():
+                page_url = value.split("#", 1)[0]
+                lines.append(
+                    f"  - {name}: Available — open Supporting Documentation: {page_url}"
+                )
+            else:
+                lines.append(f"  - {name}: {value}")
         return lines
 
     def _render_ottawa(self, p: dict[str, Any]) -> list[str]:
@@ -4177,8 +3634,14 @@ def toronto_notification_key(app: dict[str, Any]) -> str:
     notify once with aggregated addresses. Rows without a link fall back to the
     application/file number and grouped address/date metadata.
     """
-    raw_url = normalized_key_part(app.get("raw_application_url") or app.get("detail_url"))
+    # Prefer the canonical current Application Details URL.  Earlier versions
+    # keyed legacy AIC folder URLs directly, so a bad partial run could poison
+    # state and prevent the repaired crawler from retrying the same application.
+    canonical_url = normalized_key_part(app.get("detail_url"))
+    if canonical_url:
+        return "toronto:" + stable_hash({"application_url": canonical_url})[:40]
 
+    raw_url = normalized_key_part(app.get("raw_application_url"))
     if raw_url:
         return "toronto:" + stable_hash({"application_url": raw_url})[:40]
 

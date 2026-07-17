@@ -1,60 +1,78 @@
 state_db: data/dev_project_monitor.sqlite3
 notify_on_first_run: false
 request_timeout_seconds: 30
-user_agent: "KellerEnterpriseDevProjectMonitor/1.0 (+contact: hongyutu0@gmail.com)"
-
+user_agent: 'KellerEnterpriseDevProjectMonitor/1.0 (+contact: hongyutu0@gmail.com)'
 toronto:
   enabled: true
-  ckan_base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
-  package_id: "development-applications"
-  fallback_csv_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/0aa7e480-9b48-4919-98e0-6af7615b7809/resource/77f8a66a-bd43-40e6-b6c9-12a2b03a5032/download/development-applications.csv"
+  ckan_base_url: https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action
+  package_id: development-applications
+  fallback_csv_url: https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/0aa7e480-9b48-4919-98e0-6af7615b7809/resource/77f8a66a-bd43-40e6-b6c9-12a2b03a5032/download/development-applications.csv
   max_records: 500
   lookback_days: 45
-  application_types: []   # Example: ["OZ", "SA"]
-
+  application_types: []
+  render_with_playwright: true
+  browser_channel: chromium
+  browser_profile_dir: data/toronto_browser_profile
+  headed: false
+  application_service_timeout_seconds: 90
+  application_service_retries: 3
+  application_service_poll_ms: 750
+  application_service_ready_confirmations: 2
+  page_timeout_ms: 60000
+  playwright_default_timeout_ms: 2500
+  supporting_docs_mount_wait_seconds: 12
+  document_rows_wait_seconds: 10
+  application_form_download_timeout_ms: 30000
+  extract_application_form_contacts: true
+  save_debug_artifacts_on_failure: true
+  debug_artifacts_dir: data/toronto_debug
+  report_partial_on_enrichment_failure: false
+  max_detail_pages_per_run: 10
+  dry_run_max_detail_pages: 3
 ottawa:
-  # Disabled by default until a stable official machine-readable Ottawa feed is confirmed.
-  # The public DevApps pages are JavaScript-rendered, and the previously configured
-  # ExportData endpoint is not documented/verified as a stable public API.
   enabled: false
-  export_url: "https://devapps-restapi.ottawa.ca/devapps/ExportData"
-  detail_base_url: "https://devapps.ottawa.ca/en/applications"
+  export_url: https://devapps-restapi.ottawa.ca/devapps/ExportData
+  detail_base_url: https://devapps.ottawa.ca/en/applications
   max_records: 2000
   lookback_days: 45
   application_types:
-    - "Official Plan Amendment"
-    - "Plan of Subdivision"
-    - "Plan of Condominium"
-    - "Site Plan Control"
-    - "Zoning By-law Amendment"
-
+  - Official Plan Amendment
+  - Plan of Subdivision
+  - Plan of Condominium
+  - Site Plan Control
+  - Zoning By-law Amendment
 news:
   enabled: true
   max_posts_per_site: 50
   lookback_days: 21
   minimum_keyword_score: 2
   sites:
-    - name: RENX
-      base_url: "https://renx.ca/"
-      feed_urls: ["https://renx.ca/feed/"]
-    - name: RENXHomes
-      base_url: "https://renxhomes.ca/"
-      feed_urls: ["https://renxhomes.ca/feed/"]
-    - name: SustainableBiz
-      base_url: "https://sustainablebiz.ca/"
-      feed_urls: ["https://sustainablebiz.ca/feed/"]
-    - name: FoodNX
-      base_url: "https://foodnx.ca/"
-      feed_urls: ["https://foodnx.ca/feed/"]
-    - name: TechNX
-      base_url: "https://technx.ca/"
-      feed_urls: ["https://technx.ca/feed/"]
-    - name: PeopleNX
-      base_url: "https://peoplenx.ca/"
-      feed_urls: ["https://peoplenx.ca/feed/"]
-
+  - name: RENX
+    base_url: https://renx.ca/
+    feed_urls:
+    - https://renx.ca/feed/
+  - name: RENXHomes
+    base_url: https://renxhomes.ca/
+    feed_urls:
+    - https://renxhomes.ca/feed/
+  - name: SustainableBiz
+    base_url: https://sustainablebiz.ca/
+    feed_urls:
+    - https://sustainablebiz.ca/feed/
+  - name: FoodNX
+    base_url: https://foodnx.ca/
+    feed_urls:
+    - https://foodnx.ca/feed/
+  - name: TechNX
+    base_url: https://technx.ca/
+    feed_urls:
+    - https://technx.ca/feed/
+  - name: PeopleNX
+    base_url: https://peoplenx.ca/
+    feed_urls:
+    - https://peoplenx.ca/feed/
 notifications:
-  delivery_mode: "digest"   # "digest" sends one grouped alert; "individual" sends one alert per item.
+  delivery_mode: digest
   slack:
     enabled: true
     webhook_url_env: SLACK_WEBHOOK_URL
