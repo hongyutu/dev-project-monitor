@@ -36,6 +36,7 @@ from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
 LOGGER = logging.getLogger("dev_project_monitor")
+TORONTO_ENRICHMENT_REVISION = "2026-07-17-ready-latch-v2"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "state_db": "data/dev_project_monitor.sqlite3",
@@ -66,7 +67,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "application_service_timeout_seconds": 90,
         "application_service_retries": 3,
         "application_service_poll_ms": 750,
-        "application_service_ready_confirmations": 2,
         "report_partial_on_enrichment_failure": False,
         "save_debug_artifacts_on_failure": True,
         "debug_artifacts_dir": "data/toronto_debug",
@@ -983,13 +983,25 @@ class TorontoOpenDataMonitor:
                         f"Debug artifacts: {debug_path or 'not saved'}"
                     )
 
-                self._log_toronto_browser_identity(page)
-                diagnostics["widget_probe"] = self._application_widget_probe(page)
+                # The Toronto widget can be replaced by a maintenance shell less than
+                # one second after it first paints on hosted CI.  Act on the strong
+                # ready observation immediately: target Supporting Documentation
+                # before browser-identity logging or secondary readiness probes.
+                prime_clicks = self._click_supporting_docs_with_playwright_locators(page)
+                diagnostics["supporting_docs_prime_clicks"] = prime_clicks
+                if prime_clicks:
+                    try:
+                        page.wait_for_timeout(250)
+                    except Exception:
+                        pass
+
                 mount_probe = self._scroll_until_supporting_docs_mounted(page)
                 diagnostics["supporting_docs_mount_probe"] = mount_probe
 
                 section_state = self._expand_supporting_documentation(page)
                 diagnostics["supporting_documentation_state"] = section_state
+                diagnostics["widget_probe"] = self._application_widget_probe(page)
+                self._log_toronto_browser_identity(page)
                 if not section_state.get("open"):
                     debug_path = self._save_toronto_debug_artifacts(
                         page,
@@ -1246,17 +1258,21 @@ class TorontoOpenDataMonitor:
         return "unknown"
 
     def _open_and_wait_for_application(self, page: Any, url: str) -> str:
-        """Navigate with bounded retries until the application service is stable."""
+        """Navigate with bounded retries and latch the first strong ready state.
+
+        ``_application_service_state`` returns ``ready`` only after finding real
+        Toronto application evidence (Supporting Documentation plus application
+        fields, or equivalent deep widget markers).  Requiring another poll or a
+        second probe allowed the observed ``ready -> maintenance`` transition to
+        erase a genuine render.  A strong ready result is therefore terminal for
+        this navigation attempt.
+        """
         retries = max(1, int(self.config.get("application_service_retries", 3) or 3))
         timeout_seconds = max(
             15.0,
             float(self.config.get("application_service_timeout_seconds", 90) or 90),
         )
         poll_ms = max(250, int(self.config.get("application_service_poll_ms", 750) or 750))
-        confirmations = max(
-            1,
-            int(self.config.get("application_service_ready_confirmations", 2) or 2),
-        )
         final_state = "unknown"
 
         for attempt in range(1, retries + 1):
@@ -1283,39 +1299,18 @@ class TorontoOpenDataMonitor:
 
             deadline = time.monotonic() + timeout_seconds
             last_reported = ""
-            ready_polls = 0
             while time.monotonic() < deadline:
                 state = self._application_service_state(page)
                 final_state = state
+
                 if state == "ready":
-                    ready_polls += 1
-
-                    # One positive body-text observation plus a successful
-                    # shadow/frame widget probe is stronger than two raw text
-                    # polls.  Accept it immediately so a stale maintenance frame
-                    # appearing on the next poll cannot erase a real render.
-                    try:
-                        corroborating_probe = self._application_widget_probe(page)
-                    except Exception:
-                        corroborating_probe = {}
-                    if bool(corroborating_probe.get("ready")):
-                        LOGGER.info(
-                            "Toronto application service ready on attempt %d/%d "
-                            "(corroborated by application widget markers)",
-                            attempt,
-                            retries,
-                        )
-                        return "ready"
-
-                    if ready_polls >= confirmations:
-                        LOGGER.info(
-                            "Toronto application service ready on attempt %d/%d",
-                            attempt,
-                            retries,
-                        )
-                        return "ready"
-                else:
-                    ready_polls = 0
+                    LOGGER.info(
+                        "Toronto application service ready on attempt %d/%d; "
+                        "accepting first strong ready observation",
+                        attempt,
+                        retries,
+                    )
+                    return "ready"
 
                 if state != last_reported:
                     LOGGER.info(
@@ -3013,6 +3008,7 @@ class TorontoOpenDataMonitor:
             return item
 
         try:
+            LOGGER.info("Toronto enrichment revision: %s", TORONTO_ENRICHMENT_REVISION)
             LOGGER.info("Toronto render start: %s", detail_url)
             final_url, html_text = self._fetch_rendered_page(detail_url)
             LOGGER.info("Toronto render complete: %s bytes=%d", final_url or detail_url, len(html_text or ""))

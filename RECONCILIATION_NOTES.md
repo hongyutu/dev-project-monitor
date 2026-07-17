@@ -11,7 +11,7 @@ actual `dev_project_monitor.monitor` execution path.
 - Does not override `navigator.userAgent` or silently switch executables.
 - Waits for Toronto's JavaScript application service, not only
   `DOMContentLoaded`.
-- Accepts a ready observation immediately when it is independently corroborated by application-widget markers; otherwise it retains the configurable consecutive-poll requirement.
+- Accepts the first strong ready observation immediately; it is not re-polled or made conditional on a second probe.
 - Targets **Supporting Documentation** directly; page-wide **Expand All** is not
   used.
 - Treats `button.downloadFile[data-id]` as an opaque UI control, never a URL.
@@ -49,6 +49,15 @@ downgrade an already-painted application widget. The reconciled classifier now:
 
 - gives real application evidence precedence over maintenance text in another scope;
 - probes open shadow roots and child frames for application-specific markers;
-- accepts the first ready poll when those markers corroborate it; and
+- latches the first strong ready state without requiring a second probe; and
 - saves only one debug bundle for a single failure instead of duplicate
   `maintenance_response` and `render_exception` directories.
+
+## July 17 ready-latch v2
+
+The first readiness hotfix was still conditional: it accepted the first `ready`
+state only when `_application_widget_probe()` separately returned `ready=True`.
+The GitHub log proved that the main classifier could find strong application
+evidence while that secondary probe did not. Revision
+`2026-07-17-ready-latch-v2` removes the contradictory second check and primes
+Supporting Documentation immediately after the first strong ready observation.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 from dev_project_monitor.monitor import (
     DEFAULT_CONFIG,
@@ -103,6 +104,7 @@ def test_defaults_disable_partial_failure_notifications_and_api_replay() -> None
     assert toronto["browser_channel"] == "chromium"
     assert toronto["report_partial_on_enrichment_failure"] is False
     assert "document_api_replay_timeout_ms" not in toronto
+    assert "application_service_ready_confirmations" not in toronto
 
 
 def test_notification_key_prefers_canonical_url_over_poisoned_legacy_aic_key() -> None:
@@ -160,18 +162,25 @@ def test_ready_application_scope_wins_over_stale_maintenance_frame() -> None:
     assert monitor._application_service_state(object()) == "ready"
 
 
-def test_first_ready_poll_is_accepted_when_widget_probe_corroborates() -> None:
+def test_first_strong_ready_poll_is_unconditionally_latched() -> None:
     monitor = make_monitor()
     monitor.config["application_service_retries"] = 1
     monitor.config["application_service_timeout_seconds"] = 15
     monitor.config["application_service_ready_confirmations"] = 2
 
-    states = iter(["ready", "maintenance"])
-    monitor._application_service_state = lambda _page: next(states)
+    calls = {"count": 0}
+
+    def state(_page):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "ready"
+        raise AssertionError("readiness loop polled again after a strong ready result")
+
+    monitor._application_service_state = state
     monitor._application_widget_probe = lambda _page: {
-        "ready": True,
-        "marker_count": 3,
-        "strong_marker_count": 2,
+        "ready": False,
+        "marker_count": 0,
+        "strong_marker_count": 0,
     }
 
     class Mouse:
@@ -191,3 +200,14 @@ def test_first_ready_poll_is_accepted_when_widget_probe_corroborates() -> None:
             return None
 
     assert monitor._open_and_wait_for_application(Page(), "https://example.invalid") == "ready"
+    assert calls["count"] == 1
+
+
+def test_ready_path_primes_supporting_documentation_before_secondary_probe() -> None:
+    source = Path(__file__).parents[1] / "dev_project_monitor" / "monitor.py"
+    text = source.read_text(encoding="utf-8")
+    prime = text.index("prime_clicks = self._click_supporting_docs_with_playwright_locators(page)")
+    probe = text.index('diagnostics["widget_probe"] = self._application_widget_probe(page)', prime)
+    identity = text.index("self._log_toronto_browser_identity(page)", prime)
+    assert prime < probe
+    assert prime < identity

@@ -27,7 +27,6 @@ toronto:
   application_service_timeout_seconds: 90
   application_service_retries: 3
   application_service_poll_ms: 750
-  application_service_ready_confirmations: 2
   playwright_default_timeout_ms: 2500
   supporting_docs_mount_wait_seconds: 12
   document_rows_wait_seconds: 10
