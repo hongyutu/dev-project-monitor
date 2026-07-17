@@ -53,6 +53,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Read the full CSV first; cap only after filtering/grouping.
         "max_records": 0,
         "max_candidates": 500,
+        # Bound expensive detail-page rendering. Unprocessed unseen items remain
+        # unmarked and are picked up on the next invocation.
+        "max_detail_pages_per_run": 25,
+        "dry_run_max_detail_pages": 5,
         "raw_record_limit": 0,
         "render_with_playwright": True,
         "page_timeout_ms": 60000,
@@ -60,6 +64,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ocr_image_pdfs": True,
         "extract_application_form_contacts": True,
         "application_form_download_timeout_ms": 12000,
+        "playwright_default_timeout_ms": 1800,
+        "supporting_docs_mount_wait_seconds": 9,
+        "document_rows_wait_seconds": 6,
+        "inspect_child_frames": True,
+        "application_form_lower_start_ratio": 0.42,
+        "ocr_timeout_seconds": 20,
+        "source_staleness_warning_days": 14,
         "lookback_days": 45,
         "application_types": [],
     },
@@ -395,6 +406,19 @@ class TorontoOpenDataMonitor:
             or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
+
+        dated = [parse_dt(x.get("submitted_date") or x.get("last_updated")) for x in grouped]
+        dated = [value for value in dated if value]
+        if dated:
+            latest = max(dated)
+            stale_days = int(self.config.get("source_staleness_warning_days", 14) or 14)
+            if latest < utcnow() - timedelta(days=stale_days):
+                LOGGER.warning(
+                    "Toronto source may be stale: newest application date is %s (older than %d days). "
+                    "Verify the configured Open Data/AIC source before relying on notifications.",
+                    latest.date().isoformat(),
+                    stale_days,
+                )
 
         max_candidates = int(self.config.get("max_candidates", self.config.get("max_records", 0)) or 0)
         if max_candidates > 0:
@@ -805,13 +829,9 @@ class TorontoOpenDataMonitor:
         full_no_hash = full_url.split("#", 1)[0]
         parsed = urlparse(full_url)
         if base_no_hash and full_no_hash == base_no_hash:
-            # A Toronto download button exposes only button.downloadFile[data-id].
-            # When the real file URL is hidden behind JavaScript, the monitor
-            # emits a same-page fragment that carries the document name and
-            # data-id token. Treat that as meaningful instead of discarding it.
-            fragment = normalize_key(parsed.fragment).lower()
-            if "supporting-documentation" in fragment and ("data-id=" in fragment or "document=" in fragment):
-                return True
+            # A same-page fragment is navigation only.  In particular,
+            # button.downloadFile[data-id] exposes an opaque JavaScript token,
+            # not a retrievable file URL.
             return False
 
         if "/application-details/" in parsed.path and not re.search(r"download|document|attachment|file", parsed.query, re.I):
@@ -884,6 +904,8 @@ class TorontoOpenDataMonitor:
                     )
                     try:
                         page = context.new_page()
+                        page.set_default_timeout(int(self.config.get("playwright_default_timeout_ms", 1800) or 1800))
+                        page.set_default_navigation_timeout(int(self.config.get("page_timeout_ms", 60000) or 60000))
                         network_recorder = self._install_toronto_network_recorder(page)
 
                         page.goto(
@@ -932,7 +954,7 @@ class TorontoOpenDataMonitor:
                                     r"Application Number|Application Status|Supporting Documentation|Reference File|Download",
                                     re.I,
                                 )
-                            ).wait_for(timeout=30000)
+                            ).wait_for(timeout=8000)
                         except Exception:
                             pass
 
@@ -1066,27 +1088,40 @@ class TorontoOpenDataMonitor:
         return response.url, response.text
 
     def _document_scopes(self, page: Any) -> list[Any]:
-        """Return stable Playwright scopes for document inspection.
+        """Return stable scopes containing the Toronto application widget.
 
-        The Toronto page creates and destroys helper frames during redirects,
-        analytics, translation widgets, and app bootstrapping. Inspecting those
-        frames caused long hangs and repeated "Frame was detached" errors in
-        GitHub Actions. By default we inspect the main page only; enable
-        `inspect_child_frames: true` in config only for debugging.
+        The current City page may mount the application UI in a same-site iframe.
+        Earlier code ignored child frames by default, which made the Supporting
+        Documentation table invisible. Keep the main page and selected City/AIC
+        frames, while excluding analytics, survey, advertising and translation
+        frames that frequently detach.
         """
         scopes: list[Any] = [page]
-        if not self.config.get("inspect_child_frames", False):
+        if not self.config.get("inspect_child_frames", True):
             return scopes
+
+        deny_tokens = (
+            "googletagmanager", "google-analytics", "doubleclick", "medallia",
+            "youtube", "facebook", "twitter", "translate.google", "recaptcha",
+        )
+        allow_tokens = ("toronto", "aic", "application", "planning", "secure")
         try:
-            for frame in page.frames:
-                try:
-                    if frame is page.main_frame or frame.is_detached():
-                        continue
-                except Exception:
-                    continue
-                scopes.append(frame)
+            frames = list(page.frames)
         except Exception:
-            pass
+            return scopes
+
+        for frame in frames:
+            try:
+                if frame is page.main_frame or frame.is_detached():
+                    continue
+                frame_url = normalize_key(frame.url).lower()
+            except Exception:
+                continue
+            if any(token in frame_url for token in deny_tokens):
+                continue
+            if frame_url and frame_url != "about:blank" and not any(token in frame_url for token in allow_tokens):
+                continue
+            scopes.append(frame)
         return scopes
 
     def _combined_page_content(self, page: Any) -> str:
@@ -1099,74 +1134,93 @@ class TorontoOpenDataMonitor:
         return "\n".join(parts)
 
     def _supporting_docs_probe(self, page: Any) -> dict[str, int]:
-        """Cheap probe for whether the document UI has mounted."""
-        try:
-            return page.evaluate(
-                r"""
-                () => {
-                    const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-                    const bodyText = clean(document.body ? document.body.innerText || document.body.textContent || '' : '');
-                    return {
-                        downloadButtons: document.querySelectorAll('button.downloadFile[data-id], .downloadFile[data-id]').length,
-                        supportingTextMatches: /Supporting\s+Documentation/i.test(bodyText) ? 1 : 0,
-                        referenceFileMatches: /Reference\s+File/i.test(bodyText) ? 1 : 0,
-                        documentRows: Array.from(document.querySelectorAll('tr')).filter(tr => /Application Form|Architectural|Civil|Geotechnical|Hydrogeological/i.test(clean(tr.innerText || tr.textContent || ''))).length,
-                    };
+        """Cheap aggregate probe across the page and relevant application frames."""
+        totals = {
+            "downloadButtons": 0,
+            "supportingTextMatches": 0,
+            "referenceFileMatches": 0,
+            "documentRows": 0,
+        }
+        js = r"""
+        () => {
+            const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const roots = [];
+            const seenRoots = new Set();
+            const addRoot = root => {
+                if (!root || seenRoots.has(root)) return;
+                seenRoots.add(root);
+                roots.push(root);
+                let nodes = [];
+                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+            };
+            addRoot(document);
+            const all = selector => {
+                const out = [];
+                const seen = new Set();
+                for (const root of roots) {
+                    let nodes = [];
+                    try { nodes = Array.from(root.querySelectorAll(selector)); } catch (e) { nodes = []; }
+                    for (const node of nodes) if (!seen.has(node)) { seen.add(node); out.push(node); }
                 }
-                """
-            ) or {"downloadButtons": 0, "supportingTextMatches": 0, "referenceFileMatches": 0, "documentRows": 0}
-        except Exception:
-            return {"downloadButtons": 0, "supportingTextMatches": 0, "referenceFileMatches": 0, "documentRows": 0}
+                return out;
+            };
+            const bodyText = clean(document.body ? document.body.innerText || document.body.textContent || '' : '');
+            const rows = all('tr, [role="row"]');
+            return {
+                downloadButtons: all('button.downloadFile[data-id], .downloadFile[data-id]').length,
+                supportingTextMatches: /Supporting\s+Documentation/i.test(bodyText) ? 1 : 0,
+                referenceFileMatches: /Reference\s+File/i.test(bodyText) ? 1 : 0,
+                documentRows: rows.filter(tr => /Application Form|Architectural|Civil|Utilities|Geotechnical|Hydrogeological|Hydrogeology/i.test(clean(tr.innerText || tr.textContent || ''))).length,
+            };
+        }
+        """
+        for scope in self._document_scopes(page):
+            try:
+                result = scope.evaluate(js) or {}
+            except Exception:
+                continue
+            for key in totals:
+                totals[key] += int(result.get(key) or 0)
+        return totals
 
     def _scroll_until_supporting_docs_mounted(self, page: Any, max_seconds: float | None = None) -> dict[str, int]:
-        """Scroll through the JS app so lazy sections mount before we click them."""
-        max_seconds = float(max_seconds or self.config.get("supporting_docs_mount_wait_seconds", 12) or 12)
+        """Scroll the main document and relevant frames until the lazy section mounts."""
+        max_seconds = float(max_seconds or self.config.get("supporting_docs_mount_wait_seconds", 9) or 9)
         deadline = time.monotonic() + max_seconds
         best = self._supporting_docs_probe(page)
-        last_y = -1
-        stable_rounds = 0
         step = 0
         while time.monotonic() < deadline:
-            if best.get("downloadButtons", 0) or best.get("supportingTextMatches", 0) or best.get("referenceFileMatches", 0):
+            if best.get("downloadButtons") or best.get("documentRows") or best.get("referenceFileMatches"):
                 break
             step += 1
+            for scope in self._document_scopes(page):
+                try:
+                    scope.evaluate(
+                        """
+                        () => {
+                            const root = document.scrollingElement || document.documentElement || document.body;
+                            const vh = window.innerHeight || 900;
+                            if (root) root.scrollTop = Math.min(root.scrollHeight, (root.scrollTop || 0) + Math.max(650, Math.floor(vh * 0.85)));
+                            window.scrollBy(0, Math.max(650, Math.floor(vh * 0.85)));
+                        }
+                        """
+                    )
+                except Exception:
+                    continue
             try:
-                pos = page.evaluate(
-                    """
-                    () => {
-                        const y = window.scrollY || document.documentElement.scrollTop || 0;
-                        const h = Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0);
-                        const vh = window.innerHeight || document.documentElement.clientHeight || 900;
-                        window.scrollBy(0, Math.max(700, Math.floor(vh * 0.85)));
-                        return {y, h, vh, newY: window.scrollY || document.documentElement.scrollTop || 0};
-                    }
-                    """
-                ) or {}
-                new_y = int(pos.get("newY") or 0)
-                if new_y == last_y:
-                    stable_rounds += 1
-                else:
-                    stable_rounds = 0
-                last_y = new_y
-                if stable_rounds >= 2:
-                    try:
-                        page.keyboard.press("End", timeout=500)
-                    except Exception:
-                        pass
+                page.wait_for_timeout(400)
             except Exception:
-                pass
-            try:
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
+                break
             best = self._supporting_docs_probe(page)
-            if step in {1, 3, 6, 10}:
+            if step in {1, 4, 8}:
                 LOGGER.info("Toronto Supporting Documentation mount probe step %s: %s", step, best)
-        try:
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(300)
-        except Exception:
-            pass
+
+        for scope in self._document_scopes(page):
+            try:
+                scope.evaluate("window.scrollTo(0, 0)")
+            except Exception:
+                pass
         LOGGER.info("Toronto Supporting Documentation mount probe final: %s", best)
         return best
 
@@ -1256,56 +1310,60 @@ class TorontoOpenDataMonitor:
             pass
 
     def _click_supporting_docs_with_playwright_locators(self, page: Any) -> int:
-        """Click Supporting Documentation controls using Playwright locators.
+        """Open likely Supporting Documentation controls in one bounded DOM pass.
 
-        Playwright CSS/text locators pierce open shadow DOM. The previous JS-only
-        approach used document.querySelectorAll(), which misses rows and controls
-        inside shadow roots. This method is intentionally broad but bounded.
+        The old implementation performed up to dozens of locator operations, each
+        with an independent timeout. On a page without the expected controls that
+        could consume minutes. A single evaluate call per stable scope is enough.
+        """
+        js = r"""
+        () => {
+            const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const visible = el => {
+                try {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                } catch (e) { return false; }
+            };
+            const roots = [];
+            const seenRoots = new Set();
+            const addRoot = root => {
+                if (!root || seenRoots.has(root)) return;
+                seenRoots.add(root); roots.push(root);
+                let nodes = [];
+                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+            };
+            addRoot(document);
+            const controls = [];
+            for (const root of roots) {
+                let nodes = [];
+                try { nodes = Array.from(root.querySelectorAll('button, a, [role="button"], summary, h2, h3, h4, .accordion-header, .accordion-button')); } catch (e) { nodes = []; }
+                controls.push(...nodes);
+            }
+            const ranked = controls
+                .filter(visible)
+                .map(el => ({el, text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || '')}))
+                .filter(x => /^(Expand\s+All|Supporting\s+Documentation)$/i.test(x.text) || /Supporting\s+Documentation/i.test(x.text))
+                .sort((a, b) => (/Supporting/i.test(a.text) ? -1 : 1));
+            let clicked = 0;
+            for (const item of ranked.slice(0, 3)) {
+                const expanded = String(item.el.getAttribute('aria-expanded') || '').toLowerCase();
+                if (expanded === 'true' && /Supporting/i.test(item.text)) continue;
+                try { item.el.scrollIntoView({block: 'center'}); item.el.click(); clicked++; } catch (e) {}
+            }
+            return clicked;
+        }
         """
         clicked_total = 0
-        selector_groups = [
-            "button:has-text('Expand All')",
-            "a:has-text('Expand All')",
-            "[role='button']:has-text('Expand All')",
-            "text=/^\\s*Expand\\s+All\\s*$/i",
-            "button:has-text('Supporting Documentation')",
-            "a:has-text('Supporting Documentation')",
-            "[role='button']:has-text('Supporting Documentation')",
-            "summary:has-text('Supporting Documentation')",
-            "[aria-label*='Supporting Documentation' i]",
-            "text=/Supporting\\s+Documentation/i",
-        ]
         for scope in self._document_scopes(page):
-            for selector in selector_groups:
-                try:
-                    locator = scope.locator(selector)
-                    count = min(locator.count(), 8)
-                except Exception:
-                    continue
-                for index in range(count):
-                    try:
-                        target = locator.nth(index)
-                        target.scroll_into_view_if_needed(timeout=1500)
-                    except Exception:
-                        pass
-                    try:
-                        target.click(timeout=1800, force=True, no_wait_after=True)
-                        clicked_total += 1
-                        try:
-                            page.wait_for_timeout(350)
-                        except Exception:
-                            pass
-                        if sum(self._document_row_count(sc) for sc in self._document_scopes(page)) > 0:
-                            LOGGER.info(
-                                "Toronto Supporting Documentation Playwright locator click succeeded: selector=%s index=%s",
-                                selector,
-                                index,
-                            )
-                            return clicked_total
-                    except Exception:
-                        continue
+            try:
+                clicked_total += int(scope.evaluate(js) or 0)
+            except Exception:
+                continue
         if clicked_total:
-            LOGGER.info("Toronto Supporting Documentation Playwright locator clicks attempted: %s", clicked_total)
+            LOGGER.info("Toronto Supporting Documentation bounded click attempts: %s", clicked_total)
         return clicked_total
 
     def _force_supporting_docs_visible(self, page: Any) -> None:
@@ -1511,15 +1569,26 @@ class TorontoOpenDataMonitor:
             return 0
 
     def _install_toronto_network_recorder(self, page: Any) -> dict[str, Any]:
+        """Record lightweight response metadata only.
+
+        Retaining Playwright Response objects and later calling response.text()
+        can block while a streaming/unfinished response is still open. Metadata is
+        sufficient to recognize direct PDF/download URLs without that risk.
+        """
         recorder: dict[str, Any] = {"responses": [], "download_urls": []}
 
         def on_response(response: Any) -> None:
             try:
                 headers = {k.lower(): v for k, v in (response.headers or {}).items()}
                 url = normalize_key(response.url)
+                request = getattr(response, "request", None)
+                resource_type = normalize_key(getattr(request, "resource_type", "")) if request else ""
+                item = {"url": url, "headers": headers, "resource_type": resource_type}
+                responses = recorder.setdefault("responses", [])
+                if len(responses) < 400:
+                    responses.append(item)
                 if self._response_looks_like_download(url, headers):
                     recorder.setdefault("download_urls", []).append(url)
-                recorder.setdefault("responses", []).append(response)
             except Exception:
                 return
 
@@ -1550,315 +1619,146 @@ class TorontoOpenDataMonitor:
         return bool(re.search(r"\.(pdf|zip|docx?|xlsx?)(?:\?|$)", lowered_url))
 
     def _extract_network_document_data(self, recorder: dict[str, Any], base_url: str) -> tuple[dict[str, str], set[str]]:
+        """Map direct download responses by URL or Content-Disposition filename."""
         links: dict[str, str] = {}
         available: set[str] = set()
-
-        for response in recorder.get("responses", [])[:500]:
-            try:
-                url = normalize_key(response.url)
-                headers = {k.lower(): v for k, v in (response.headers or {}).items()}
-                request = getattr(response, "request", None)
-                resource_type = getattr(request, "resource_type", "") if request else ""
-            except Exception:
+        for item in recorder.get("responses", [])[:400]:
+            if not isinstance(item, dict):
                 continue
-
-            lowered_url = url.lower()
-            content_type = normalize_key(headers.get("content-type", "")).lower()
-            relevant = (
-                resource_type in {"xhr", "fetch", "document"}
-                or "json" in content_type
-                or any(token in lowered_url for token in ("aic", "application", "document", "attachment", "file", "folder", "submission"))
-            )
-            if not relevant:
+            url = normalize_key(item.get("url"))
+            headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
+            disposition = html.unescape(normalize_key(headers.get("content-disposition", "")))
+            label = f"{url} {disposition}"
+            name = self._document_name_for_text(label)
+            if not name:
                 continue
-
-            # File responses are useful as direct URLs, but they usually do not identify
-            # which row they came from unless captured during a row click.
+            available.add(name)
             if self._response_looks_like_download(url, headers) and self._is_meaningful_document_url(url, base_url):
-                continue
-
-            try:
-                body_text = response.text()
-            except Exception:
-                body_text = ""
-            if not body_text or len(body_text) > 2_500_000:
-                continue
-
-            found_links, found_available = self._extract_document_data_from_text(body_text, url, base_url)
-            for name in found_available:
-                available.add(name)
-            for name, href in found_links.items():
-                if href and not links.get(name):
-                    links[name] = href
-
+                links.setdefault(name, url)
         return links, available
 
     def _download_button_fallback_url(self, base_url: str, document_name: str, data_id: str = "") -> str:
-        """Return a stable URL for a Toronto Supporting Documentation row.
+        """Return the application page's Supporting Documentation anchor.
 
-        The Toronto page renders document rows as DataTables rows with a
-        button.downloadFile[data-id] control. The data-id is a JavaScript token,
-        not an href. When the real download URL is not exposed by the network
-        layer, this URL still opens the correct application details page and
-        carries the document/data-id in the fragment for debugging and manual
-        lookup.
+        ``button.downloadFile[data-id]`` contains an opaque UI token, not a
+        reusable URL.  Never serialize it as a pseudo download link.  The
+        caller may still use this page anchor as a manual navigation fallback.
         """
-        base = normalize_key(base_url).split("#", 1)[0]
-        if not base:
-            return ""
-        fragment_parts = ["supporting-documentation"]
-        if document_name:
-            fragment_parts.append("document=" + quote_plus(normalize_key(document_name)))
-        if data_id:
-            fragment_parts.append("data-id=" + quote_plus(normalize_key(data_id)))
-        return base + "#" + "&".join(fragment_parts)
+        return self._supporting_docs_anchor(base_url)
 
     def _extract_download_button_document_rows_with_locators(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str], int, int]:
-        """Use Playwright locators to read document rows.
+        """Deprecated compatibility wrapper; bulk bounded JS extraction is used."""
+        return {}, set(), 0, 0
 
-        Unlike page.evaluate(document.querySelectorAll(...)), Playwright's CSS
-        locators pierce open shadow DOM. This directly matches the observed City
-        row shape: td[0] is the Reference File and button.downloadFile[data-id]
-        is in the Action cell.
+    def _extract_download_button_document_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
+        """Read Supporting Documentation rows in one bounded operation per scope.
+
+        The first cell identifies the document.  A ``data-id`` proves that a
+        Download control exists, but is deliberately *not* returned as a URL.
+        Only a genuine href/file endpoint is placed in ``links``.
         """
         links: dict[str, str] = {}
         available: set[str] = set()
         rows_seen = 0
         token_rows = 0
-        selectors = "table tbody tr, table tr, tr, [role='row']"
-
-        for scope in self._document_scopes(page):
-            try:
-                locator = scope.locator(selectors)
-                count = min(locator.count(), 2500)
-            except Exception:
-                continue
-            for index in range(count):
-                row = locator.nth(index)
-                rows_seen += 1
-                try:
-                    text = normalize_key(row.inner_text(timeout=500))
-                except Exception:
-                    try:
-                        text = normalize_key(row.text_content(timeout=500))
-                    except Exception:
-                        text = ""
-                if not text or "no matching records" in text.lower():
-                    continue
-
-                first_cell = ""
-                try:
-                    cells = row.locator("td, [role='cell']")
-                    if cells.count() > 0:
-                        first_cell = normalize_key(cells.nth(0).inner_text(timeout=500))
-                except Exception:
-                    first_cell = ""
-
-                document_name = self._document_name_for_text(first_cell) or self._document_name_for_text(text)
-                if not document_name:
-                    continue
-                available.add(document_name)
-
-                data_id = ""
-                href = ""
-                try:
-                    control = row.locator("button.downloadFile[data-id], .downloadFile[data-id]").first
-                    if control.count() > 0:
-                        data_id = normalize_key(control.get_attribute("data-id", timeout=500))
-                        href = normalize_key(control.get_attribute("href", timeout=500))
-                except Exception:
-                    pass
-                if not data_id:
-                    try:
-                        control = row.locator("button[data-id], [data-id], a[href], button:has-text('Download'), a:has-text('Download')").first
-                        if control.count() > 0:
-                            data_id = normalize_key(control.get_attribute("data-id", timeout=500))
-                            href = href or normalize_key(control.get_attribute("href", timeout=500))
-                    except Exception:
-                        pass
-
-                if href:
-                    full_url = urljoin(base_url, href)
-                    if self._is_meaningful_document_url(full_url, base_url):
-                        links.setdefault(document_name, full_url)
-
-                if not links.get(document_name) and data_id:
-                    token_rows += 1
-                    links.setdefault(document_name, self._download_button_fallback_url(base_url, document_name, data_id))
-
-        if available:
-            LOGGER.info(
-                "Detected Toronto document rows via Playwright locators for %s: rows_inspected=%s; token_rows=%s; required=%s; links=%s",
-                base_url,
-                rows_seen,
-                token_rows,
-                ", ".join(sorted(available)),
-                ", ".join(sorted(links)) or "none",
-            )
-        return links, available, rows_seen, token_rows
-
-    def _extract_download_button_document_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
-        """Extract Toronto Supporting Documentation rows from the exact DOM contract.
-
-        The City page renders rows like:
-
-            <tr>
-              <td>Application Form</td>
-              <td>2026-06-26</td>
-              <td>1.39</td>
-              <td><button class="downloadFile" data-id="TOKEN">Download</button></td>
-            </tr>
-
-        A normal href usually does not exist. The reliable signal is therefore
-        column 1 = document name plus column 4 = button.downloadFile[data-id].
-        DataTables may only render 10 visible rows, so this method also reads
-        DataTables' internal row data when available.
-        """
-        links: dict[str, str] = {}
-        available: set[str] = set()
-        rows_seen = 0
-        exact_token_rows = 0
-
-        locator_links, locator_available, locator_rows_seen, locator_token_rows = self._extract_download_button_document_rows_with_locators(page, base_url)
-        rows_seen += locator_rows_seen
-        exact_token_rows += locator_token_rows
-        for name in locator_available:
-            available.add(name)
-        for name, href in locator_links.items():
-            if href and not links.get(name):
-                links[name] = href
 
         js = r"""
         () => {
+            const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const wanted = /Application\s+Form|Architectural|Civil|Utilities|Servicing|Grading|Stormwater|Geotechnical|Geo[-\s]?tech|Hydrogeological|Hydrogeology|Groundwater|Dewatering/i;
+            const roots = [];
+            const seenRoots = new Set();
+            const addRoot = root => {
+                if (!root || seenRoots.has(root)) return;
+                seenRoots.add(root);
+                roots.push(root);
+                let nodes = [];
+                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+            };
+            addRoot(document);
+
             const out = [];
-            const seen = new Set();
-
-            const clean = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
-
-            const textFromHtml = (value) => {
-                const raw = String(value ?? '');
-                const div = document.createElement('div');
-                div.innerHTML = raw;
-                return clean(div.innerText || div.textContent || raw);
+            const seenRows = new Set();
+            const addRow = (source, firstCell, rowText, hrefs, dataIds) => {
+                const first = clean(firstCell);
+                const text = clean(rowText);
+                if (!wanted.test(first || text)) return;
+                const key = [first, text, ...(hrefs || []), ...(dataIds || [])].join('|');
+                if (seenRows.has(key) || out.length >= 300) return;
+                seenRows.add(key);
+                out.push({source, first_cell: first, text, hrefs: hrefs || [], data_ids: dataIds || []});
             };
-
-            const collectAttrsFromRoot = (root) => {
-                const result = {data_ids: [], hrefs: [], onclicks: [], classes: []};
+            const attrsFromNode = node => {
+                const hrefs = [];
+                const dataIds = [];
                 const add = (arr, value) => {
-                    const text = clean(value);
-                    if (text && !arr.includes(text)) arr.push(text);
+                    const v = clean(value);
+                    if (v && !arr.includes(v)) arr.push(v);
                 };
-                if (!root) return result;
-
-                // Prefer the exact City control first. Its data-id is the real
-                // row token exposed in DevTools.
-                for (const node of root.querySelectorAll('button.downloadFile[data-id], .downloadFile[data-id]')) {
-                    add(result.data_ids, node.getAttribute('data-id'));
-                    add(result.classes, node.getAttribute('class'));
+                let nodes = [];
+                try { nodes = [node, ...node.querySelectorAll('a[href], [href], [src], [formaction], [data-url], [data-href], [data-download-url], [data-document-url], [data-file-url], button.downloadFile[data-id], .downloadFile[data-id]')]; } catch (e) { nodes = [node]; }
+                for (const el of nodes) {
+                    if (!el || !el.getAttribute) continue;
+                    add(dataIds, el.getAttribute('data-id'));
+                    for (const attr of ['href','src','formaction','data-url','data-href','data-download-url','data-document-url','data-file-url']) add(hrefs, el.getAttribute(attr));
                 }
-
-                const nodes = [root, ...root.querySelectorAll('a, button, input, [href], [src], [formaction], [onclick], [data-id], [data-url], [data-href], [data-download-url], [data-document-url], [data-file-url], [data-attachment-url]')];
-                for (const node of nodes) {
-                    if (!node || !node.getAttributeNames) continue;
-                    const cls = node.getAttribute('class');
-                    if (cls) add(result.classes, cls);
-                    for (const attr of node.getAttributeNames()) {
-                        const lower = attr.toLowerCase();
-                        const value = node.getAttribute(attr);
-                        if (!value) continue;
-                        if (lower === 'data-id' || lower.endsWith('-id')) add(result.data_ids, value);
-                        if (lower === 'href' || lower === 'src' || lower === 'formaction' || lower.includes('url') || lower.includes('href')) add(result.hrefs, value);
-                        if (lower === 'onclick') add(result.onclicks, value);
-                    }
-                }
-                return result;
+                return {hrefs, dataIds};
             };
-
-            const collectAttrsFromHtml = (value) => {
+            const textFromHtml = value => {
+                const div = document.createElement('div');
+                div.innerHTML = String(value ?? '');
+                return clean(div.innerText || div.textContent || value);
+            };
+            const attrsFromHtml = value => {
                 const raw = String(value ?? '');
                 const div = document.createElement('div');
                 div.innerHTML = raw;
-                const result = collectAttrsFromRoot(div);
-
-                // Be tolerant of escaped strings returned by DataTables.
-                const add = (arr, val) => {
-                    const text = clean(val);
-                    if (text && !arr.includes(text)) arr.push(text);
-                };
-                for (const match of raw.matchAll(/class\s*=\s*["']([^"']*downloadFile[^"']*)["'][\s\S]*?data-id\s*=\s*["']([^"']+)["']/gi)) {
-                    add(result.classes, match[1]);
-                    add(result.data_ids, match[2]);
-                }
-                for (const match of raw.matchAll(/data-id\s*=\s*["']([^"']+)["'][\s\S]*?class\s*=\s*["']([^"']*downloadFile[^"']*)["']/gi)) {
-                    add(result.data_ids, match[1]);
-                    add(result.classes, match[2]);
-                }
-                for (const match of raw.matchAll(/data-id\s*=\s*["']([^"']+)["']/gi)) add(result.data_ids, match[1]);
-                for (const match of raw.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) add(result.hrefs, match[1]);
-                for (const match of raw.matchAll(/onclick\s*=\s*["']([^"']+)["']/gi)) add(result.onclicks, match[1]);
-                return result;
+                const attrs = attrsFromNode(div);
+                for (const match of raw.matchAll(/data-id\s*=\s*["']([^"']+)["']/gi)) if (!attrs.dataIds.includes(clean(match[1]))) attrs.dataIds.push(clean(match[1]));
+                for (const match of raw.matchAll(/(?:href|src|data-(?:url|href|download-url|document-url|file-url))\s*=\s*["']([^"']+)["']/gi)) if (!attrs.hrefs.includes(clean(match[1]))) attrs.hrefs.push(clean(match[1]));
+                return attrs;
             };
 
-            const addRow = (source, firstCell, cells, attrs) => {
-                const safeCells = (cells || []).map(v => String(v ?? ''));
-                const first = textFromHtml(firstCell ?? safeCells[0] ?? '');
-                const text = safeCells.map(textFromHtml).join(' ').replace(/\s+/g, ' ').trim();
-                const html = safeCells.join(' ');
-                const dataIds = attrs?.data_ids || [];
-                const hrefs = attrs?.hrefs || [];
-                const onclicks = attrs?.onclicks || [];
-                const classes = attrs?.classes || [];
-                if (!first && !text && !dataIds.length && !hrefs.length) return;
-                const key = [source, first, text, dataIds.join('|'), hrefs.join('|')].join('||');
-                if (seen.has(key)) return;
-                seen.add(key);
-                out.push({source, first_cell: first, text, html, data_ids: dataIds, hrefs, onclicks, classes});
-            };
+            for (const root of roots) {
+                let tables = [];
+                try { tables = Array.from(root.querySelectorAll('table')); } catch (e) { tables = []; }
+                for (const table of tables.slice(0, 30)) {
+                    const tableText = clean(table.innerText || table.textContent || '');
+                    const tableHtml = String(table.innerHTML || '');
+                    if (!/Reference\s+File|Supporting\s+Documentation|downloadFile|Application\s+Form/i.test(tableText + ' ' + tableHtml)) continue;
 
-            const tables = Array.from(document.querySelectorAll('table'));
+                    let rows = [];
+                    try { rows = Array.from(table.querySelectorAll('tbody tr, tr')); } catch (e) { rows = []; }
+                    for (const tr of rows.slice(0, 300)) {
+                        const cells = Array.from(tr.children || []).filter(el => /^(TD|TH)$/i.test(el.tagName || ''));
+                        const first = clean(cells[0]?.innerText || cells[0]?.textContent || '');
+                        const text = clean(tr.innerText || tr.textContent || '');
+                        const attrs = attrsFromNode(tr);
+                        addRow('dom', first, text, attrs.hrefs, attrs.dataIds);
+                    }
 
-            // DataTables internal data, including rows not currently visible in
-            // the 10-row DOM page.
-            if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
-                for (const table of tables) {
+                    // DataTables may retain non-visible pages internally.  Read
+                    // at most 300 records without changing pagination or drawing.
                     try {
-                        if (window.jQuery.fn.dataTable.isDataTable && !window.jQuery.fn.dataTable.isDataTable(table)) continue;
-                        const dt = window.jQuery(table).DataTable();
-                        try { if (dt.page && dt.page.len) dt.page.len(100).draw(false); } catch (e) {}
-
-                        let data = [];
-                        try { data = dt.rows().data().toArray(); } catch (e) { data = []; }
-                        for (const row of data.slice(0, 2000)) {
-                            let cells = [];
-                            if (Array.isArray(row)) cells = row;
-                            else if (row && typeof row === 'object') cells = Object.values(row);
-                            else cells = [row];
-                            const attrs = {data_ids: [], hrefs: [], onclicks: [], classes: []};
-                            for (const cell of cells) {
-                                const cellAttrs = collectAttrsFromHtml(cell);
-                                attrs.data_ids.push(...cellAttrs.data_ids);
-                                attrs.hrefs.push(...cellAttrs.hrefs);
-                                attrs.onclicks.push(...cellAttrs.onclicks);
-                                attrs.classes.push(...cellAttrs.classes);
+                        if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable && window.jQuery.fn.dataTable.isDataTable(table)) {
+                            const dt = window.jQuery(table).DataTable();
+                            const data = dt.rows().data().toArray().slice(0, 300);
+                            for (const row of data) {
+                                const cells = Array.isArray(row) ? row : (row && typeof row === 'object' ? Object.values(row) : [row]);
+                                const attrs = {hrefs: [], dataIds: []};
+                                for (const cell of cells) {
+                                    const found = attrsFromHtml(cell);
+                                    for (const href of found.hrefs) if (!attrs.hrefs.includes(href)) attrs.hrefs.push(href);
+                                    for (const id of found.dataIds) if (!attrs.dataIds.includes(id)) attrs.dataIds.push(id);
+                                }
+                                addRow('datatable', textFromHtml(cells[0]), cells.map(textFromHtml).join(' '), attrs.hrefs, attrs.dataIds);
                             }
-                            addRow('datatable', cells[0], cells, attrs);
                         }
                     } catch (e) {}
                 }
             }
-
-            // Currently visible DOM rows. This is the path matching the DevTools
-            // screenshot exactly: first td is the Reference File, fourth td has
-            // button.downloadFile[data-id].
-            for (const tr of document.querySelectorAll('table tbody tr, table tr, tr')) {
-                const tds = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
-                const cells = tds.length ? tds.map(td => td.innerHTML || td.textContent || '') : [tr.innerHTML || tr.textContent || ''];
-                const firstCell = tds.length ? (tds[0].innerHTML || tds[0].textContent || '') : cells[0];
-                const attrs = collectAttrsFromRoot(tr);
-                addRow('dom', firstCell, cells, attrs);
-            }
-
-            return out.slice(0, 2500);
+            return out;
         }
         """
 
@@ -1866,49 +1766,34 @@ class TorontoOpenDataMonitor:
             try:
                 raw_rows = scope.evaluate(js) or []
             except Exception as exc:
-                LOGGER.info("Could not inspect exact Toronto downloadFile rows for %s: %s", base_url, exc)
-                raw_rows = []
-
-            for row in raw_rows:
+                LOGGER.info("Could not inspect Toronto document rows for %s: %s", base_url, exc)
+                continue
+            for row in raw_rows[:300]:
                 rows_seen += 1
                 if not isinstance(row, dict):
                     continue
                 first_cell = normalize_key(row.get("first_cell"))
-                text = normalize_key(row.get("text") or row.get("html"))
-                if not text or "no matching records" in text.lower():
-                    continue
-
-                # Column 1 is authoritative. Fall back to full row text only for
-                # DataTables object rows where the first-cell order is unknown.
-                document_name = self._document_name_for_text(first_cell) or self._document_name_for_text(text)
+                row_text = normalize_key(row.get("text"))
+                document_name = self._document_name_for_text(first_cell) or self._document_name_for_text(row_text)
                 if not document_name:
                     continue
                 available.add(document_name)
-
+                if any(normalize_key(value) for value in (row.get("data_ids") or [])):
+                    token_rows += 1
                 for href in row.get("hrefs") or []:
                     full_url = urljoin(base_url, normalize_key(href))
                     if self._is_meaningful_document_url(full_url, base_url):
                         links.setdefault(document_name, full_url)
                         break
 
-                if not links.get(document_name):
-                    data_ids = [normalize_key(value) for value in (row.get("data_ids") or []) if normalize_key(value)]
-                    if data_ids:
-                        exact_token_rows += 1
-                        links.setdefault(document_name, self._download_button_fallback_url(base_url, document_name, data_ids[0]))
-
-        if available:
-            LOGGER.info(
-                "Detected Toronto exact downloadFile rows for %s: rows_inspected=%s; token_rows=%s; required=%s; links=%s",
-                base_url,
-                rows_seen,
-                exact_token_rows,
-                ", ".join(sorted(available)),
-                ", ".join(sorted(links)) or "none",
-            )
-        else:
-            LOGGER.info("No required Toronto exact downloadFile rows detected for %s after inspecting %s row(s)", base_url, rows_seen)
-
+        LOGGER.info(
+            "Toronto document-row scan for %s: rows=%d; token_rows=%d; available=%s; direct_links=%s",
+            base_url,
+            rows_seen,
+            token_rows,
+            ", ".join(sorted(available)) or "none",
+            ", ".join(sorted(links)) or "none",
+        )
         return links, available
 
     def _extract_document_data_from_text(self, body_text: str, source_url: str, base_url: str) -> tuple[dict[str, str], set[str]]:
@@ -2014,83 +1899,44 @@ class TorontoOpenDataMonitor:
         return candidates
 
     def _set_document_table_to_all_rows_with_locators(self, scope: Any, search_term: str = "") -> None:
-        """Use Playwright locators to search/show 100 rows, including open shadow DOM."""
-        term = normalize_key(search_term)
-        try:
-            inputs = scope.locator("input[type='search'], input[aria-label*='Search' i], input[placeholder*='Search' i]")
-            for index in range(min(inputs.count(), 8)):
-                try:
-                    inputs.nth(index).fill(term, timeout=800)
-                    inputs.nth(index).press("Enter", timeout=500)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        try:
-            selects = scope.locator("select")
-            for index in range(min(selects.count(), 12)):
-                sel = selects.nth(index)
-                for value in ("100", "-1", "50", "25", "10"):
-                    try:
-                        sel.select_option(value=value, timeout=700)
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+        """Compatibility wrapper; table manipulation is now performed in one JS call."""
+        return None
 
     def _set_document_table_to_all_rows(self, scope: Any, search_term: str = "") -> None:
-        """Make the Supporting Documentation table expose matching rows in the DOM.
-
-        This must be best-effort and fast. Detached frames or absent tables are
-        normal during Toronto page bootstrapping and should not log repeatedly.
-        """
-        try:
-            self._set_document_table_to_all_rows_with_locators(scope, search_term)
-        except Exception:
-            pass
+        """Search and expand only tables that look like Supporting Documentation."""
         try:
             scope.evaluate(
-                """
+                r"""
                 (searchTerm) => {
-                    const terms = (searchTerm || '').trim();
-                    const fire = (el, type) => {
-                        try { el.dispatchEvent(new Event(type, { bubbles: true })); } catch (e) {}
+                    const term = String(searchTerm || '').trim();
+                    const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+                    const isDocTable = table => {
+                        const text = clean(table.innerText || table.textContent || '');
+                        return /Reference\s+File|Application\s+Form|Supporting\s+Documentation|downloadFile/i.test(text + ' ' + (table.innerHTML || ''));
                     };
-
+                    const tables = Array.from(document.querySelectorAll('table')).filter(isDocTable);
                     if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
-                        window.jQuery('table').each(function () {
+                        for (const table of tables) {
                             try {
-                                const dt = window.jQuery(this).DataTable();
-                                if (dt.search) dt.search(terms);
-                                if (dt.page && dt.page.len) dt.page.len(100).draw(false);
+                                if (window.jQuery.fn.dataTable.isDataTable && !window.jQuery.fn.dataTable.isDataTable(table)) continue;
+                                const dt = window.jQuery(table).DataTable();
+                                if (dt.search) dt.search(term);
+                                if (dt.page && dt.page.len) dt.page.len(-1).draw(false);
+                                else if (dt.draw) dt.draw(false);
                             } catch (e) {}
-                        });
+                        }
                     }
-
-                    const searchInputs = Array.from(document.querySelectorAll(
-                        'input[type="search"], input[aria-label*="Search" i], input[placeholder*="Search" i]'
-                    ));
-                    for (const input of searchInputs.slice(0, 5)) {
-                        input.focus();
-                        input.value = terms;
-                        fire(input, 'input');
-                        fire(input, 'keyup');
-                        fire(input, 'change');
-                    }
-
-                    for (const sel of Array.from(document.querySelectorAll('select')).slice(0, 10)) {
-                        const opts = Array.from(sel.options || []);
-                        if (!opts.length) continue;
-                        const chosen =
-                            opts.find(o => o.value === '-1') ||
-                            opts.find(o => o.value === '100') ||
-                            opts.find(o => /100/.test(o.textContent || '')) ||
-                            opts[opts.length - 1];
-                        if (chosen) {
-                            sel.value = chosen.value;
-                            fire(sel, 'input');
-                            fire(sel, 'change');
+                    const fire = (el, type) => { try { el.dispatchEvent(new Event(type, {bubbles: true})); } catch (e) {} };
+                    for (const table of tables) {
+                        const id = table.id || '';
+                        if (!id) continue;
+                        for (const input of document.querySelectorAll(`input[type="search"][aria-controls="${CSS.escape(id)}"]`)) {
+                            input.value = term; fire(input, 'input'); fire(input, 'keyup'); fire(input, 'change');
+                        }
+                        for (const sel of document.querySelectorAll(`select[aria-controls="${CSS.escape(id)}"]`)) {
+                            const opts = Array.from(sel.options || []);
+                            const chosen = opts.find(o => o.value === '-1') || opts.find(o => o.value === '100') || opts[opts.length - 1];
+                            if (chosen) { sel.value = chosen.value; fire(sel, 'change'); }
                         }
                     }
                 }
@@ -2100,7 +1946,7 @@ class TorontoOpenDataMonitor:
         except Exception:
             return
         try:
-            scope.wait_for_timeout(350)
+            scope.wait_for_timeout(250)
         except Exception:
             pass
 
@@ -2484,96 +2330,31 @@ class TorontoOpenDataMonitor:
         return captured, available
 
     def _extract_application_form_text_from_page(self, page: Any, base_url: str) -> str:
-        """Click only the Application Form download button and extract its text.
-
-        Other document rows are detected from DataTables/data-id tokens without
-        clicking. The Application Form is the one exception because owner and
-        applicant fields live inside the PDF/form itself.
-        """
+        """Download the Application Form once, without scanning hundreds of rows."""
         timeout_ms = int(self.config.get("application_form_download_timeout_ms", 12000) or 12000)
-        scopes = self._document_scopes(page)
-        rows: list[Any] = []
-
-        for scope in scopes:
+        for scope in self._document_scopes(page):
             try:
-                self._set_document_table_to_all_rows(scope)
+                self._set_document_table_to_all_rows(scope, "Application Form")
             except Exception:
                 pass
-        for scope in scopes:
-            rows.extend(self._visible_document_rows(scope, "Application Form"))
-
-        if not rows:
-            for term in ("Application Form", "Application"):
-                for scope in scopes:
-                    try:
-                        self._set_document_table_to_all_rows(scope, term)
-                    except Exception:
-                        pass
-                rows = []
-                for scope in scopes:
-                    rows.extend(self._visible_document_rows(scope, "Application Form"))
-                if rows:
-                    break
-
-        if not rows:
-            LOGGER.info("Application Form row not visible as a Playwright locator for %s; trying exact JS downloadFile click", base_url)
-            js_text = self._extract_application_form_text_by_exact_js_click(page, base_url, timeout_ms)
-            if normalize_key(js_text):
-                return js_text
-            LOGGER.info("Application Form row not visible for %s; contact extraction skipped", base_url)
-            return ""
-
-        for row in rows[:2]:
-            try:
-                control = row.locator("button.downloadFile, a:has-text('Download'), button:has-text('Download'), input[value*='Download' i]").first
-                try:
-                    if control.count() == 0:
-                        control = row.locator("a, button, input[type='button'], input[type='submit'], [role='button']").first
-                except Exception:
-                    pass
-
-                try:
-                    control.scroll_into_view_if_needed(timeout=3000)
-                except Exception:
-                    pass
-
-                with page.expect_download(timeout=timeout_ms) as download_info:
-                    control.click(timeout=5000, no_wait_after=True, force=True)
-                download = download_info.value
-
-                file_bytes = self._read_playwright_download_bytes(download)
-                suggested_name = normalize_key(getattr(download, "suggested_filename", ""))
-                try:
-                    download.delete()
-                except Exception:
-                    pass
-
-                text = self._extract_application_form_text_from_bytes(file_bytes, suggested_name)
-                if normalize_key(text):
-                    LOGGER.info(
-                        "Downloaded Toronto Application Form for %s; filename=%s; extracted_chars=%s",
-                        base_url,
-                        suggested_name or "unknown",
-                        len(text),
-                    )
-                    return text
-            except Exception as exc:
-                LOGGER.info("Could not download/parse Toronto Application Form for %s: %s", base_url, exc)
-                continue
-
-        return ""
+        self._force_supporting_docs_visible(page)
+        return self._extract_application_form_text_by_exact_js_click(page, base_url, timeout_ms)
 
     def _extract_application_form_text_by_exact_js_click(self, page: Any, base_url: str, timeout_ms: int) -> str:
-        """Fallback: click button.downloadFile[data-id] in the Application Form row by JS."""
-        click_js = r"""
+        """Find the exact Application Form row and capture its PDF once.
+
+        Toronto has used both attachment downloads and PDF-viewer/new-tab
+        behavior.  Event listeners cover both without stacking mutually
+        exclusive ``expect_*`` waits.  The poll has one hard deadline.
+        """
+        find_js = r"""
         () => {
             const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
             const roots = [];
-            const seenRoots = new Set();
+            const seen = new Set();
             const addRoot = root => {
-                if (!root || seenRoots.has(root)) return;
-                seenRoots.add(root);
-                roots.push(root);
+                if (!root || seen.has(root)) return;
+                seen.add(root); roots.push(root);
                 let nodes = [];
                 try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
                 for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
@@ -2582,55 +2363,206 @@ class TorontoOpenDataMonitor:
             for (const root of roots) {
                 let rows = [];
                 try { rows = Array.from(root.querySelectorAll('table tbody tr, table tr, tr, [role="row"]')); } catch (e) { rows = []; }
-                for (const tr of rows) {
-                    const cells = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
-                    if (cells.length < 4) continue;
-                    const first = normalize(cells[0].innerText || cells[0].textContent || '');
-                    if (!/Application\s+Form/i.test(first)) continue;
+                for (const tr of rows.slice(0, 400)) {
+                    const cells = Array.from(tr.querySelectorAll(':scope > td, :scope > [role="cell"]'));
+                    const first = normalize(cells[0]?.innerText || cells[0]?.textContent || tr.innerText || tr.textContent || '');
+                    if (!/\bApplication\s+Form\b/i.test(first)) continue;
                     let button = tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]');
-                    if (!button) {
-                        button = Array.from(tr.querySelectorAll('button, a, input[type="button"], input[type="submit"], [role="button"]'))
-                            .find(el => /Download/i.test(el.innerText || el.textContent || el.value || ''));
-                    }
+                    if (!button) button = Array.from(tr.querySelectorAll('button, a, [role="button"]')).find(el => /Download|Open/i.test(normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || '')));
+                    if (button) return {found: true, dataId: button.getAttribute('data-id') || ''};
+                }
+            }
+            return {found: false};
+        }
+        """
+        click_js = r"""
+        () => {
+            const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const roots = [];
+            const seen = new Set();
+            const addRoot = root => {
+                if (!root || seen.has(root)) return;
+                seen.add(root); roots.push(root);
+                let nodes = [];
+                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+            };
+            addRoot(document);
+            for (const root of roots) {
+                let rows = [];
+                try { rows = Array.from(root.querySelectorAll('table tbody tr, table tr, tr, [role="row"]')); } catch (e) { rows = []; }
+                for (const tr of rows.slice(0, 400)) {
+                    const cells = Array.from(tr.querySelectorAll(':scope > td, :scope > [role="cell"]'));
+                    const first = normalize(cells[0]?.innerText || cells[0]?.textContent || tr.innerText || tr.textContent || '');
+                    if (!/\bApplication\s+Form\b/i.test(first)) continue;
+                    let button = tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]');
+                    if (!button) button = Array.from(tr.querySelectorAll('button, a, [role="button"]')).find(el => /Download|Open/i.test(normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || '')));
                     if (!button) continue;
-                    button.scrollIntoView({block: 'center', inline: 'center'});
+                    try { button.scrollIntoView({block: 'center'}); } catch (e) {}
                     button.click();
-                    return {clicked: true, first, dataId: button.getAttribute('data-id') || ''};
+                    return {clicked: true, dataId: button.getAttribute('data-id') || ''};
                 }
             }
             return {clicked: false};
         }
         """
+
         for scope in self._document_scopes(page):
             try:
-                self._set_document_table_to_all_rows(scope, "Application Form")
+                probe = scope.evaluate(find_js) or {}
             except Exception:
-                pass
-        self._force_supporting_docs_visible(page)
+                continue
+            if not probe.get("found"):
+                continue
 
-        try:
-            with page.expect_download(timeout=timeout_ms) as download_info:
-                result = page.evaluate(click_js)
-                LOGGER.info("Application Form exact JS click result for %s: %s", base_url, result)
-            download = download_info.value
-            file_bytes = self._read_playwright_download_bytes(download)
-            suggested_name = normalize_key(getattr(download, "suggested_filename", ""))
+            downloads: list[Any] = []
+            popups: list[Any] = []
+            response_urls: list[str] = []
+
+            def on_download(download: Any) -> None:
+                downloads.append(download)
+
+            def on_popup(popup: Any) -> None:
+                popups.append(popup)
+
+            def on_response(response: Any) -> None:
+                try:
+                    headers = {k.lower(): v for k, v in (response.headers or {}).items()}
+                    if self._response_looks_like_download(response.url, headers):
+                        response_urls.append(normalize_key(response.url))
+                except Exception:
+                    return
+
             try:
-                download.delete()
-            except Exception:
-                pass
-            text = self._extract_application_form_text_from_bytes(file_bytes, suggested_name)
-            if normalize_key(text):
-                LOGGER.info(
-                    "Downloaded Toronto Application Form by exact JS click for %s; filename=%s; extracted_chars=%s",
-                    base_url,
-                    suggested_name or "unknown",
-                    len(text),
-                )
-                return text
-        except Exception as exc:
-            LOGGER.info("Exact JS Application Form download failed for %s: %s", base_url, exc)
+                page.on("download", on_download)
+                page.on("popup", on_popup)
+                page.on("response", on_response)
+                original_url = normalize_key(page.url)
+                result = scope.evaluate(click_js)
+                LOGGER.info("Application Form exact click result for %s: %s", base_url, result)
+                if not (result or {}).get("clicked"):
+                    continue
+
+                deadline = time.monotonic() + max(1.0, timeout_ms / 1000.0)
+                while time.monotonic() < deadline:
+                    current_url = normalize_key(page.url)
+                    if downloads or popups or response_urls or (current_url and current_url != original_url):
+                        try:
+                            page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+                        break
+                    try:
+                        page.wait_for_timeout(200)
+                    except Exception:
+                        break
+
+                file_bytes = b""
+                filename = ""
+                if downloads:
+                    download = downloads[0]
+                    file_bytes = self._read_playwright_download_bytes(download)
+                    filename = normalize_key(getattr(download, "suggested_filename", ""))
+                    try:
+                        download.delete()
+                    except Exception:
+                        pass
+
+                # A PDF viewer or new tab may be used instead of a download.
+                if not file_bytes:
+                    candidate_pages = list(popups)
+                    if normalize_key(page.url) != original_url:
+                        candidate_pages.append(page)
+                    for candidate_page in candidate_pages[:2]:
+                        try:
+                            candidate_url = normalize_key(candidate_page.url)
+                            file_bytes = self._read_browser_url_bytes(candidate_page, candidate_url, timeout_ms)
+                            if file_bytes:
+                                filename = urlparse(candidate_url).path.rsplit("/", 1)[-1]
+                                break
+                        except Exception as exc:
+                            LOGGER.info("Could not read Application Form PDF viewer for %s: %s", base_url, exc)
+
+                # Last resort: replay a captured GET file endpoint through the
+                # browser context's request client, which shares session cookies.
+                if not file_bytes:
+                    for candidate_url in reversed(response_urls[-5:]):
+                        file_bytes = self._read_browser_url_bytes(page, candidate_url, timeout_ms)
+                        if file_bytes:
+                            filename = urlparse(candidate_url).path.rsplit("/", 1)[-1]
+                            break
+
+                text = self._extract_application_form_text_from_bytes(file_bytes, filename)
+                if normalize_key(text):
+                    LOGGER.info(
+                        "Captured Toronto Application Form for %s; filename=%s; extracted_chars=%s",
+                        base_url,
+                        filename or "unknown",
+                        len(text),
+                    )
+                    return text
+            except Exception as exc:
+                LOGGER.info("Application Form capture failed for %s: %s", base_url, exc)
+            finally:
+                try:
+                    page.remove_listener("download", on_download)
+                    page.remove_listener("popup", on_popup)
+                    page.remove_listener("response", on_response)
+                except Exception:
+                    pass
+                for popup in popups:
+                    try:
+                        popup.close()
+                    except Exception:
+                        pass
+            break
+
+        LOGGER.info("Application Form row/download not available for %s", base_url)
         return ""
+
+    def _read_browser_url_bytes(self, page: Any, url: str, timeout_ms: int) -> bytes:
+        """Read an HTTP(S), data, or blob URL with a hard browser-side bound."""
+        url = normalize_key(url)
+        if not url:
+            return b""
+        if url.startswith("data:"):
+            try:
+                import base64
+                header, payload = url.split(",", 1)
+                return base64.b64decode(payload) if ";base64" in header.lower() else unquote_plus(payload).encode("utf-8")
+            except Exception:
+                return b""
+        if url.startswith("blob:"):
+            try:
+                encoded = page.evaluate(
+                    r"""
+                    async ({url, timeoutMs}) => {
+                        const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('blob timeout')), timeoutMs));
+                        const work = fetch(url).then(r => r.arrayBuffer()).then(buffer => {
+                            const bytes = new Uint8Array(buffer);
+                            let binary = '';
+                            const chunk = 0x8000;
+                            for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+                            return btoa(binary);
+                        });
+                        return await Promise.race([work, timeout]);
+                    }
+                    """,
+                    {"url": url, "timeoutMs": max(1000, timeout_ms)},
+                )
+                if encoded:
+                    import base64
+                    return base64.b64decode(encoded)
+            except Exception:
+                return b""
+        if url.startswith(("http://", "https://")):
+            try:
+                response = page.context.request.get(url, timeout=max(1000, timeout_ms), fail_on_status_code=False)
+                if response.ok:
+                    return response.body()
+            except Exception:
+                return b""
+        return b""
 
     def _read_playwright_download_bytes(self, download: Any) -> bytes:
         try:
@@ -2674,7 +2606,11 @@ class TorontoOpenDataMonitor:
 
     def _looks_expired(self, html_text: str) -> bool:
         page_text = BeautifulSoup(html_text or "", "html.parser").get_text(" ", strip=True).lower()
-        return any(marker in page_text for marker in ("page not found", "404", "access denied", "forbidden"))
+        markers = (
+            "page not found", "404 not found", "error 404", "access denied",
+            "you are not authorized", "request forbidden",
+        )
+        return any(marker in page_text for marker in markers)
 
     def _extract_document_links(self, html_text: str, base_url: str) -> dict[str, str]:
         """Extract required links from the rendered Supporting Documentation table."""
@@ -2746,11 +2682,9 @@ class TorontoOpenDataMonitor:
                 for attr_name, attr_value in getattr(node, "attrs", {}).items():
                     attr_lower = attr_name.lower()
                     if attr_lower == "data-id":
-                        classes = " ".join(getattr(node, "get", lambda *_: "")("class", []) or [])
-                        context_text = element_context(element)
-                        doc_name = self._document_name_for_text(context_text)
-                        if doc_name and "downloadFile".lower() in classes.lower():
-                            candidates.append(self._download_button_fallback_url(base_url, doc_name, str(attr_value)))
+                        # Opaque City UI token: useful for proving the row has a
+                        # Download control, but never a retrievable URL.
+                        continue
                     if attr_lower in {"href", "src"} or attr_lower.startswith("data"):
                         add_from_text(attr_value, allow_raw=True)
                     elif attr_lower == "onclick":
@@ -2816,6 +2750,11 @@ class TorontoOpenDataMonitor:
         if not application_form_url:
             return contacts
 
+        parsed = urlparse(application_form_url)
+        if "/application-details/" in parsed.path and ("supporting-documentation" in parsed.fragment.lower() or not re.search(r"\.(?:pdf)(?:$|\?)", application_form_url, re.I)):
+            # Page anchors and data-id fragments are navigation aids, not files.
+            return contacts
+
         try:
             response = self.http.get(application_form_url)
         except Exception as exc:
@@ -2823,7 +2762,7 @@ class TorontoOpenDataMonitor:
             return contacts
 
         content_type = response.headers.get("content-type", "").lower()
-        if "pdf" in content_type or application_form_url.lower().split("?")[0].endswith(".pdf"):
+        if "pdf" in content_type or response.content[:5] == b"%PDF-" or application_form_url.lower().split("?")[0].endswith(".pdf"):
             text = self._extract_pdf_text(response.content)
         else:
             text = BeautifulSoup(response.text or "", "html.parser").get_text("\n", strip=True)
@@ -2831,140 +2770,230 @@ class TorontoOpenDataMonitor:
         return self._parse_application_form_contacts(text)
 
     def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
-        """Extract owner/applicant text from the lower half of page 1 only."""
+        """Extract page-1 owner/applicant data from the lower portion of the form.
+
+        Work is deliberately bounded: one page, at most 250 widgets, and OCR with
+        a hard timeout. This prevents malformed fillable PDFs or Tesseract from
+        holding the entire monitor indefinitely.
+        """
         text_parts: list[str] = []
+        doc = None
         try:
             import fitz
 
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             if len(doc) < 1:
                 return ""
-
             page = doc[0]
             page_rect = page.rect
-            lower_half = fitz.Rect(
-                page_rect.x0,
-                page_rect.y0 + (page_rect.height * 0.5),
-                page_rect.x1,
-                page_rect.y1,
-            )
+            ratio = float(self.config.get("application_form_lower_start_ratio", 0.42) or 0.42)
+            ratio = min(0.70, max(0.30, ratio))
+            lower = fitz.Rect(page_rect.x0, page_rect.y0 + page_rect.height * ratio, page_rect.x1, page_rect.y1)
 
-            # Text extraction is clipped to the owner/applicant area. This avoids
-            # mixing in header/property/application metadata from the top half.
-            text_parts.append(page.get_text("text", clip=lower_half))
+            # Sorted words preserve form rows better than plain text extraction.
+            words = page.get_text("words", clip=lower, sort=True) or []
+            line_groups: dict[tuple[int, int], list[tuple[float, str]]] = {}
+            for word in words[:5000]:
+                if len(word) < 8:
+                    continue
+                x0, _y0, _x1, _y1, value, block_no, line_no, _word_no = word[:8]
+                line_groups.setdefault((int(block_no), int(line_no)), []).append((float(x0), str(value)))
+            if line_groups:
+                ordered_lines = [
+                    " ".join(value for _x, value in sorted(parts, key=lambda item: item[0]))
+                    for _key, parts in sorted(line_groups.items(), key=lambda item: item[0])
+                ]
+                text_parts.append("\n".join(ordered_lines))
+            else:
+                text_parts.append(page.get_text("text", clip=lower, sort=True))
 
-            # Fillable PDFs expose values as widgets, not ordinary page text.
-            # Keep only widgets whose rectangle intersects the lower half.
+            # Walk the linked widget list with an explicit cap instead of an
+            # unbounded generator over potentially malformed form objects.
             try:
-                for widget in page.widgets() or []:
+                widget = page.first_widget
+                seen = 0
+                while widget is not None and seen < 250:
+                    seen += 1
                     rect = getattr(widget, "rect", None)
+                    include = True
                     if rect is not None:
                         try:
-                            widget_rect = fitz.Rect(rect)
-                            if not widget_rect.intersects(lower_half):
-                                continue
+                            include = fitz.Rect(rect).intersects(lower)
                         except Exception:
-                            pass
+                            include = True
+                    if include:
+                        field_name = normalize_key(getattr(widget, "field_name", ""))
+                        field_value = normalize_key(getattr(widget, "field_value", ""))
+                        if field_name or field_value:
+                            text_parts.append(f"{field_name}: {field_value}".strip(" :"))
+                    try:
+                        widget = widget.next
+                    except Exception:
+                        break
+            except Exception as exc:
+                LOGGER.info("Application Form widget extraction skipped: %s", exc)
 
-                    field_name = normalize_key(getattr(widget, "field_name", ""))
-                    field_value = normalize_key(getattr(widget, "field_value", ""))
-                    if field_name or field_value:
-                        text_parts.append(f"{field_name}: {field_value}".strip(" :"))
-            except Exception:
-                pass
-
-            if len("\n".join(text_parts).strip()) < 200 and self.config.get("ocr_image_pdfs", True):
+            joined = "\n".join(part for part in text_parts if normalize_key(part))
+            parsed_contacts = self._parse_application_form_contacts(joined)
+            needs_ocr = len(joined.strip()) < 180 or not self._contacts_have_content(parsed_contacts)
+            if needs_ocr and self.config.get("ocr_image_pdfs", True):
                 try:
                     import pytesseract
                     from PIL import Image
 
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=lower_half)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=lower)
                     image = Image.open(io.BytesIO(pix.tobytes("png")))
-                    text_parts.append(pytesseract.image_to_string(image))
+                    timeout = int(self.config.get("ocr_timeout_seconds", 20) or 20)
+                    text_parts.append(pytesseract.image_to_string(image, timeout=timeout))
                 except Exception as exc:
-                    LOGGER.info("OCR fallback unavailable for lower-half application form PDF: %s", exc)
+                    LOGGER.info("OCR fallback unavailable/timed out for application form PDF: %s", exc)
         except Exception as exc:
-            LOGGER.info("Could not parse application form PDF lower half: %s", exc)
+            LOGGER.info("Could not parse application form PDF lower section: %s", exc)
+        finally:
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
-        return "\n".join(part for part in text_parts if part)
+        return "\n".join(part for part in text_parts if normalize_key(part))
 
     def _parse_application_form_contacts(self, text: str) -> dict[str, dict[str, str]]:
-        clean = re.sub(r"[ \t]+", " ", text or "")
-        clean = re.sub(r"\n+", "\n", clean)
+        """Parse owner/applicant details from visible text and PDF widget fields."""
+        raw = (text or "").replace("\x00", " ")
+        raw = re.sub(r"[ \t]+", " ", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        clean = raw.strip()
+        empty = self._empty_party_contacts()
+        if not clean:
+            return empty
 
-        def section_between(start_pattern: str, end_pattern: str) -> str:
-            start_match = re.search(start_pattern, clean, flags=re.I | re.S)
-            if not start_match:
+        lines = [normalize_key(line) for line in clean.splitlines() if normalize_key(line)]
+        field_pairs: list[tuple[str, str]] = []
+        for line in lines:
+            match = re.match(r"^([^:]{2,100})\s*:\s*(.*)$", line)
+            if match:
+                key = compact_key(match.group(1))
+                value = normalize_key(match.group(2))
+                if key and value:
+                    field_pairs.append((key, value))
+
+        def field_value(party_tokens: tuple[str, ...], value_tokens: tuple[str, ...]) -> str:
+            candidates: list[str] = []
+            for key, value in field_pairs:
+                if not any(token in key for token in party_tokens):
+                    continue
+                if any(token in key for token in value_tokens):
+                    candidates.append(value)
+            return candidates[0] if candidates else ""
+
+        def section(start_patterns: tuple[str, ...], end_patterns: tuple[str, ...]) -> str:
+            starts = [m for pattern in start_patterns for m in [re.search(pattern, clean, re.I)] if m]
+            if not starts:
                 return ""
-            start = start_match.start()
-            end_match = re.search(end_pattern, clean[start_match.end():], flags=re.I | re.S)
-            end = start_match.end() + end_match.start() if end_match else len(clean)
-            return clean[start:end]
+            start_match = min(starts, key=lambda m: m.start())
+            remainder = clean[start_match.start():]
+            ends = [m for pattern in end_patterns for m in [re.search(pattern, remainder[start_match.end()-start_match.start():], re.I)] if m]
+            if not ends:
+                return remainder
+            end_match = min(ends, key=lambda m: m.start())
+            offset = start_match.end() - start_match.start()
+            return remainder[:offset + end_match.start()]
+
+        owner_section = section(
+            (r"Registered\s+Owner", r"Owner\(s\)\s+of\s+subject\s+land", r"Property\s+Owner"),
+            (r"Applicant\s+Name", r"Applicant\s+Information", r"This\s+section\s+for\s+Office\s+Use", r"Agent\s+Information"),
+        )
+        applicant_section = section(
+            (r"Applicant\s+Name", r"Applicant\s+Information"),
+            (r"This\s+section\s+for\s+Office\s+Use", r"Declaration", r"File\s+No\.?", r"Owner'?s\s+Authorization"),
+        )
+
+        email_re = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+        phone_re = re.compile(r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}(?:\s*(?:x|ext\.?)[-\s]*\d+)?", re.I)
 
         def first_email(segment: str) -> str:
-            match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", segment, flags=re.I)
+            match = email_re.search(segment or "")
             return match.group(0) if match else ""
 
         def first_phone(segment: str) -> str:
-            match = re.search(r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", segment)
+            match = phone_re.search(segment or "")
             return normalize_key(match.group(0)) if match else ""
 
-        def lines(segment: str) -> list[str]:
-            return [normalize_key(line) for line in segment.splitlines() if normalize_key(line)]
+        def labelled_value(segment: str, labels: tuple[str, ...]) -> str:
+            for label in labels:
+                match = re.search(rf"{label}\s*:?\s*([^\n|]{{2,180}})", segment or "", re.I)
+                if match:
+                    value = normalize_key(match.group(1))
+                    value = re.split(r"\s+(?:Owner\s+E-?mail|Business\s+(?:E-?mail|Telephone|Fax|Address)|Applicant\s+is)\b", value, maxsplit=1, flags=re.I)[0]
+                    if value:
+                        return value.strip(" :;,-")
+            return ""
 
-        def extract_name(segment: str, email: str, label_words: list[str]) -> str:
-            for line in lines(segment):
-                if email and email in line:
-                    candidate = normalize_key(line.replace(email, ""))
-                    candidate = re.sub(r"Owner E-?mail:?|Business E-?mail:?", "", candidate, flags=re.I).strip(" :;,-")
-                    if candidate and not any(word.lower() in candidate.lower() for word in label_words):
-                        return candidate
-            skip = (
-                "registered owner",
-                "owner e-mail",
-                "business address",
-                "business telephone",
-                "business fax",
-                "applicant name",
-                "business e-mail",
-                "applicant is",
-            )
-            for line in lines(segment):
-                if any(marker in line.lower() for marker in skip):
+        def fallback_name(segment: str, forbidden: tuple[str, ...]) -> str:
+            for line in [normalize_key(x) for x in (segment or "").splitlines() if normalize_key(x)]:
+                lower = line.lower()
+                if any(token in lower for token in forbidden):
                     continue
-                if re.search(r"[A-Za-z]", line):
-                    return re.sub(r"\s+", " ", line).strip(" :;,-")
+                if email_re.search(line) or phone_re.search(line):
+                    continue
+                if re.search(r"[A-Za-z]", line) and len(line) <= 160:
+                    return line.strip(" :;,-")
             return ""
 
         def extract_address(segment: str) -> str:
-            seg_lines = lines(segment)
+            value = labelled_value(segment, (r"Business\s+Address", r"Mailing\s+Address", r"Address"))
+            if value:
+                return shorten(value, 300)
+            seg_lines = [normalize_key(x) for x in (segment or "").splitlines() if normalize_key(x)]
             for index, line in enumerate(seg_lines):
-                if "business address" in line.lower():
-                    for candidate in seg_lines[index + 1 : index + 4]:
-                        if not any(marker in candidate.lower() for marker in ("business telephone", "business fax", "applicant name", "applicant is")):
-                            return shorten(candidate, 250)
+                if re.search(r"business\s+address|mailing\s+address", line, re.I):
+                    parts = []
+                    for candidate in seg_lines[index + 1:index + 4]:
+                        if re.search(r"telephone|fax|e-?mail|applicant\s+name", candidate, re.I):
+                            break
+                        parts.append(candidate)
+                    if parts:
+                        return shorten(", ".join(parts), 300)
             return ""
 
-        owner_section = section_between(r"Registered Owner\(s\)|Owners? of subject land", r"Applicant name|Applicant is|This section for Office Use")
-        applicant_section = section_between(r"Applicant name", r"This section for Office Use|File No|Declaration")
-
-        owner_email = first_email(owner_section)
-        applicant_email = first_email(applicant_section)
-
-        return {
-            "land_owner": {
-                "name": extract_name(owner_section, owner_email, ["owner e-mail"]),
-                "phone": first_phone(owner_section),
-                "email": owner_email,
-                "address": extract_address(owner_section),
-            },
-            "applicant": {
-                "name": extract_name(applicant_section, applicant_email, ["business e-mail"]),
-                "phone": first_phone(applicant_section),
-                "email": applicant_email,
-                "address": extract_address(applicant_section),
-            },
+        owner = {
+            "name": field_value(("owner", "registeredowner", "propertyowner"), ("name", "company", "corporation")),
+            "phone": field_value(("owner", "registeredowner", "propertyowner"), ("phone", "telephone", "tel")),
+            "email": field_value(("owner", "registeredowner", "propertyowner"), ("email", "mail")),
+            "address": field_value(("owner", "registeredowner", "propertyowner"), ("address", "street")),
         }
+        applicant = {
+            "name": field_value(("applicant",), ("name", "company", "corporation")),
+            "phone": field_value(("applicant",), ("phone", "telephone", "tel")),
+            "email": field_value(("applicant",), ("email", "mail")),
+            "address": field_value(("applicant",), ("address", "street")),
+        }
+
+        owner["email"] = owner["email"] or first_email(owner_section)
+        owner["phone"] = owner["phone"] or first_phone(owner_section)
+        owner["name"] = owner["name"] or labelled_value(owner_section, (r"Registered\s+Owner\(s\)", r"Registered\s+Owner", r"Owner\s+Name", r"Property\s+Owner"))
+        owner["name"] = owner["name"] or fallback_name(owner_section, ("registered owner", "owner e-mail", "business address", "business telephone", "business fax"))
+        owner["address"] = owner["address"] or extract_address(owner_section)
+
+        applicant["email"] = applicant["email"] or first_email(applicant_section)
+        applicant["phone"] = applicant["phone"] or first_phone(applicant_section)
+        applicant["name"] = applicant["name"] or labelled_value(applicant_section, (r"Applicant\s+Name", r"Name\s+of\s+Applicant"))
+        applicant["name"] = applicant["name"] or fallback_name(applicant_section, ("applicant name", "applicant information", "business e-mail", "business address", "business telephone", "applicant is"))
+        applicant["address"] = applicant["address"] or extract_address(applicant_section)
+
+        # Validate common contact fields and strip obvious labels accidentally captured.
+        for party in (owner, applicant):
+            if party["email"] and not email_re.fullmatch(party["email"]):
+                found = first_email(party["email"])
+                party["email"] = found
+            if party["phone"]:
+                found = first_phone(party["phone"])
+                party["phone"] = found
+            party["name"] = re.sub(r"^(?:Registered\s+Owner\(s\)|Registered\s+Owner|Applicant\s+Name)\s*:?\s*", "", party["name"], flags=re.I).strip(" :;,-")
+            party["address"] = shorten(party["address"], 300)
+
+        return {"land_owner": owner, "applicant": applicant}
 
     def _extract_label_value(self, text: str, labels: list[str]) -> str:
         if not text:
@@ -2979,6 +3008,7 @@ class TorontoOpenDataMonitor:
         detail_url = self._application_details_url(raw_url)
         item["detail_url"] = detail_url
         item["link_status"] = self._link_status(raw_url, detail_url)
+        item["enrichment_status"] = "not_attempted"
         item.setdefault("document_links", {name: "" for name in self.REQUIRED_DOCUMENTS})
         item.setdefault("land_owner", {"name": "", "phone": "", "email": "", "address": ""})
         item.setdefault("applicant", {"name": "", "phone": "", "email": "", "address": ""})
@@ -2990,6 +3020,7 @@ class TorontoOpenDataMonitor:
         )
 
         if item["link_status"] != "current" or not detail_url:
+            item["enrichment_status"] = "skipped"
             LOGGER.info("Toronto enrich skipped: link_status=%s", item["link_status"])
             return item
 
@@ -2999,6 +3030,7 @@ class TorontoOpenDataMonitor:
             LOGGER.info("Toronto render complete: %s bytes=%d", final_url or detail_url, len(html_text or ""))
             if self._looks_expired(html_text):
                 item["link_status"] = "expired"
+                item["enrichment_status"] = "expired"
                 LOGGER.info("Toronto render indicated expired page: %s", final_url or detail_url)
                 return item
 
@@ -3012,25 +3044,23 @@ class TorontoOpenDataMonitor:
                 item["detail_url"],
             )
 
-            LOGGER.info("Toronto contact extraction: trying rendered HTML for %s", item["detail_url"])
             form_contacts = self._extract_application_form_contacts_from_rendered_html(html_text)
             if self._contacts_have_content(form_contacts):
                 item.update(form_contacts)
-                LOGGER.info("Toronto contact extraction succeeded from rendered HTML for %s", item["detail_url"])
+                LOGGER.info("Toronto contact extraction succeeded from rendered Application Form for %s", item["detail_url"])
             else:
                 form_url = item["document_links"].get("Application Form")
-                if form_url:
-                    LOGGER.info("Toronto contact extraction fallback: downloading Application Form for %s", item["detail_url"])
-                    fallback_contacts = self._extract_application_form_contacts(form_url)
-                    if self._contacts_have_content(fallback_contacts):
-                        item.update(fallback_contacts)
-                        LOGGER.info("Toronto contact extraction succeeded from Application Form for %s", item["detail_url"])
-                    else:
-                        LOGGER.info("Toronto contact extraction found no owner/applicant data in Application Form for %s", item["detail_url"])
+                fallback_contacts = self._extract_application_form_contacts(form_url) if form_url else self._empty_party_contacts()
+                if self._contacts_have_content(fallback_contacts):
+                    item.update(fallback_contacts)
+                    LOGGER.info("Toronto contact extraction succeeded from direct Application Form URL for %s", item["detail_url"])
                 else:
-                    LOGGER.info("Toronto contact extraction skipped: Application Form link not found for %s", item["detail_url"])
+                    LOGGER.info("Toronto contact extraction found no owner/applicant data for %s", item["detail_url"])
+            item["enrichment_status"] = "ok"
         except Exception as exc:
-            LOGGER.info("Could not enrich Toronto application page %s: %s", detail_url, exc)
+            item["enrichment_status"] = "failed"
+            item["enrichment_error"] = shorten(str(exc), 500)
+            LOGGER.exception("Could not enrich Toronto application page %s: %s", detail_url, exc)
 
         return item
 
@@ -3730,40 +3760,57 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
     ready_items: list[NotificationItem] = []
 
     if config.get("toronto", {}).get("enabled", True):
-        LOGGER.info("Checking Toronto Open Data development applications")
+        LOGGER.info("Checking Toronto development applications")
         try:
             toronto_monitor = TorontoOpenDataMonitor(http, config["toronto"])
             apps = toronto_monitor.fetch_new_candidates()
             toronto_items = to_notification_items_from_toronto(apps)
+            notify_first = bool(config.get("notify_on_first_run", False))
+            source_empty = store.source_is_empty("toronto_open_data")
 
-            # Performance-critical: do not render/enrich every recent Toronto
-            # candidate on every run. Rendering the JavaScript application page
-            # is expensive, and most candidates have already been seen. Filter
-            # against SQLite first, then enrich only items that will actually be
-            # considered for notification. On first run with notify_on_first_run
-            # disabled, this marks candidates seen without opening hundreds of
-            # detail pages.
-            toronto_unseen = filter_unseen(
-                store,
-                toronto_items,
-                bool(config.get("notify_on_first_run", False)),
-                mark=not dry_run,
-            )
+            if source_empty and not notify_first and not dry_run:
+                for item in toronto_items:
+                    store.mark_seen(item.source, item.item_key, stable_hash(item.payload))
+                toronto_unseen: list[NotificationItem] = []
+                LOGGER.info(
+                    "First Toronto run: bootstrapped %d application(s) without opening detail pages or notifying.",
+                    len(toronto_items),
+                )
+            else:
+                toronto_unseen = [item for item in toronto_items if not store.has_seen(item.source, item.item_key)]
+
+            queue_total = len(toronto_unseen)
+            queue_limit_key = "dry_run_max_detail_pages" if dry_run else "max_detail_pages_per_run"
+            queue_limit = int(config.get("toronto", {}).get(queue_limit_key, 5 if dry_run else 25) or 0)
+            if queue_limit > 0 and queue_total > queue_limit:
+                toronto_unseen = toronto_unseen[:queue_limit]
+                LOGGER.warning(
+                    "Toronto detail-page queue bounded to %d of %d unseen application(s) for this run; "
+                    "the remainder stay unseen for a later invocation.",
+                    len(toronto_unseen),
+                    queue_total,
+                )
 
             LOGGER.info("Toronto enrichment queue: %d item(s) need detail-page processing", len(toronto_unseen))
             for index, item in enumerate(toronto_unseen, start=1):
                 progress_label = item.title or item.payload.get("file_number") or item.payload.get("address") or "Toronto application"
                 LOGGER.info("Toronto enrichment progress %d/%d: %s", index, len(toronto_unseen), progress_label)
                 enriched_payload = toronto_monitor.enrich_application(item.payload)
-                ready_items.append(
-                    dataclasses.replace(
-                        item,
-                        url=enriched_payload.get("detail_url")
-                        or enriched_payload.get("raw_application_url")
-                        or item.url,
-                        payload=enriched_payload,
+                if enriched_payload.get("enrichment_status") == "failed":
+                    LOGGER.warning(
+                        "Toronto enrichment failed and will be retried on the next run: %s; %s",
+                        progress_label,
+                        enriched_payload.get("enrichment_error") or "unknown error",
                     )
+                    continue
+                ready_item = dataclasses.replace(
+                    item,
+                    url=enriched_payload.get("detail_url") or enriched_payload.get("raw_application_url") or item.url,
+                    payload=enriched_payload,
                 )
+                ready_items.append(ready_item)
+                if not dry_run:
+                    store.mark_seen(ready_item.source, ready_item.item_key, stable_hash(enriched_payload))
                 LOGGER.info(
                     "Toronto enrichment finished %d/%d: %s; documents=%d; owner=%s; applicant=%s",
                     index,
@@ -3775,12 +3822,12 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
                 )
 
             LOGGER.info(
-                "Toronto Open Data yielded %d candidate application(s); %d new item(s) required enrichment",
+                "Toronto source yielded %d candidate application(s); %d unseen item(s) required enrichment",
                 len(apps),
                 len(toronto_unseen),
             )
         except Exception as exc:
-            LOGGER.exception("Toronto Open Data check failed: %s", exc)
+            LOGGER.exception("Toronto development application check failed: %s", exc)
 
     if config.get("ottawa", {}).get("enabled", False):
         LOGGER.info("Checking Ottawa DevApps development applications")
