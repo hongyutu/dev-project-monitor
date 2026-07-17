@@ -1,5 +1,7 @@
 name: Development Project Monitor
 
+# Toronto workflow revision: 2026-07-17-xvfb-sync-v3.1
+
 on:
   schedule:
     - cron: "17 9,16 * * *"
@@ -50,15 +52,22 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Restore monitor state and Toronto browser profile
+      - name: Restore monitor state
         uses: actions/cache@v5
         with:
-          path: |
-            data/dev_project_monitor.sqlite3
-            data/toronto_browser_profile
+          path: data/dev_project_monitor.sqlite3
           key: dev-project-monitor-state-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             dev-project-monitor-state-${{ runner.os }}-
+
+      - name: Restore Toronto browser profile
+        uses: actions/cache@v5
+        with:
+          path: data/toronto_browser_profile
+          key: toronto-browser-profile-v3-${{ runner.os }}-${{ hashFiles('requirements.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            toronto-browser-profile-v3-${{ runner.os }}-${{ hashFiles('requirements.txt') }}-
+            toronto-browser-profile-v3-${{ runner.os }}-
 
       - name: Reset monitor state for manual initial run
         if: github.event_name == 'workflow_dispatch' && inputs.reset_state == 'true'
@@ -77,7 +86,7 @@ jobs:
       - name: Install Chromium and OCR dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
+          sudo apt-get install -y tesseract-ocr xvfb
           python -m playwright install --with-deps chromium
 
       - name: Run monitor
@@ -93,6 +102,7 @@ jobs:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == 'true' && '1' || '0' }}
           DIAGNOSE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnose_url || '' }}
         run: |
+          echo "Toronto workflow revision: 2026-07-17-xvfb-sync-v3.1"
           mkdir -p data/toronto_debug data/toronto_browser_profile
           ARGS=(--config config.yml)
           if [ "$DRY_RUN" = "1" ]; then
@@ -101,7 +111,7 @@ jobs:
           if [ -n "$DIAGNOSE_URL" ]; then
             ARGS+=(--diagnose-url "$DIAGNOSE_URL")
           fi
-          python -m dev_project_monitor.monitor "${ARGS[@]}"
+          xvfb-run -a -s "-screen 0 1440x1000x24" python -m dev_project_monitor.monitor "${ARGS[@]}"
 
       - name: Upload Toronto diagnostics
         if: always()
