@@ -61,3 +61,33 @@ The GitHub log proved that the main classifier could find strong application
 evidence while that secondary probe did not. Revision
 `2026-07-17-ready-latch-v2` removes the contradictory second check and primes
 Supporting Documentation immediately after the first strong ready observation.
+
+## July 17 Supporting Documentation click-latch v3
+
+The GitHub log then showed a second independent timing defect:
+`supportingTextMatches` became 1 at mount step 1, but the monitor ignored that
+signal, continued scrolling until the application widget disappeared, reset to
+the top, and only then attempted the click.
+
+Revision `2026-07-17-supporting-click-latch-v3` now:
+
+- treats the first Supporting Documentation text match as an immediate action signal;
+- clicks before another scroll or slow poll can replace the widget;
+- verifies table/accordion state in a tight no-scroll window;
+- searches any visible element, including nested div/span/header variants, and
+  walks to an actionable ancestor or descendant;
+- falls back to Playwright's exact text locator, which pierces open shadow roots;
+- uses smaller, faster progressive scroll steps only while no section text exists;
+- does not reset the page to the top before the targeted click.
+
+GitHub Actions now runs headed Chromium under Xvfb. More importantly, the monitor
+starts Playwright's bundled Chromium as a normal browser process and attaches to
+it over CDP. This retains the version-matched executable and persistent profile
+but avoids Playwright's launch automation flag. The validated identity is a
+normal `Chrome/...` user agent with `navigator.webdriver == false`, rather than
+`HeadlessChrome/...` with `navigator.webdriver == true`.
+
+The SQLite state cache and browser-profile cache are separated. The browser cache
+uses a v3 key, while the existing monitor state continues to restore normally.
+Service-worker and render caches are cleared at launch, but cookies and local
+storage remain persistent.

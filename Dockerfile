@@ -12,4 +12,4 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 COPY . .
 RUN mkdir -p /app/data/toronto_browser_profile /app/data/toronto_debug
 
-CMD ["python", "-m", "dev_project_monitor.monitor", "--config", "config.yml"]
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1440x1000x24", "python", "-m", "dev_project_monitor.monitor", "--config", "config.yml"]

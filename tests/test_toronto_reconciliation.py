@@ -211,3 +211,68 @@ def test_ready_path_primes_supporting_documentation_before_secondary_probe() -> 
     identity = text.index("self._log_toronto_browser_identity(page)", prime)
     assert prime < probe
     assert prime < identity
+
+
+def test_mount_loop_clicks_first_supporting_text_before_any_scroll() -> None:
+    monitor = make_monitor()
+    monitor.config["supporting_docs_mount_wait_seconds"] = 2
+    calls = {"probe": 0, "click": 0, "state": 0, "scroll": 0}
+
+    def probe(_page):
+        calls["probe"] += 1
+        if calls["click"]:
+            return {
+                "downloadButtons": 1,
+                "supportingTextMatches": 1,
+                "referenceFileMatches": 1,
+                "documentRows": 1,
+            }
+        return {
+            "downloadButtons": 0,
+            "supportingTextMatches": 1,
+            "referenceFileMatches": 0,
+            "documentRows": 0,
+        }
+
+    def state(_page):
+        calls["state"] += 1
+        return {
+            "found": True,
+            "expanded": bool(calls["click"]),
+            "empty": False,
+            "visible_rows": int(bool(calls["click"])),
+            "open": bool(calls["click"]),
+        }
+
+    def click(_page):
+        calls["click"] += 1
+        return 1
+
+    class Scope:
+        def evaluate(self, _script):
+            calls["scroll"] += 1
+            raise AssertionError("mount loop scrolled after Supporting Documentation was detected")
+
+    class Page:
+        def wait_for_timeout(self, _ms: int) -> None:
+            return None
+
+    monitor._supporting_docs_probe = probe
+    monitor._supporting_documentation_state = state
+    monitor._click_supporting_docs_with_playwright_locators = click
+    monitor._document_scopes = lambda _page: [Scope()]
+
+    result = monitor._scroll_until_supporting_docs_mounted(Page())
+    assert calls["click"] == 1
+    assert calls["scroll"] == 0
+    assert result["documentRows"] == 1
+
+
+def test_ci_uses_headful_bundled_chromium_under_xvfb() -> None:
+    assert DEFAULT_CONFIG["toronto"]["headed"] is True
+    root = Path(__file__).parents[1]
+    workflow = (root / ".github" / "workflows" / "dev-project-monitor.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "xvfb-run -a" in workflow
+    assert "headed: true" in (root / "config.yml").read_text(encoding="utf-8")

@@ -12,8 +12,10 @@ toronto:
   application_types: []
   render_with_playwright: true
   browser_channel: chromium
+  browser_launch_mode: bundled-cdp
   browser_profile_dir: data/toronto_browser_profile
-  headed: false
+  headed: true
+  clear_browser_runtime_cache: true
   application_service_timeout_seconds: 90
   application_service_retries: 3
   application_service_poll_ms: 750

@@ -5,29 +5,38 @@
 - `dev_project_monitor/monitor.py` passes Python compilation.
 - The package imports and its CLI help renders successfully.
 - Both YAML configuration files parse successfully.
-- Nine reconciliation regression tests pass:
-  - legacy AIC folder URLs are rejected as documents;
-  - Application Details URLs are not treated as direct files;
-  - proven document-row availability is preserved;
-  - application-service readiness distinguishes loading, ready, and maintenance;
-  - notifications label page-only availability correctly;
-  - canonical Toronto state keys supersede poisoned legacy AIC keys;
-  - a real application scope wins over stale maintenance text in another frame;
-  - the first strong ready poll is latched even when a separate widget probe would not corroborate it.
+- Eleven Toronto reconciliation regression tests pass.
+- Legacy AIC folder URLs and Application Details pages are rejected as direct documents.
+- Canonical Toronto state keys supersede poisoned legacy AIC keys.
+- A real application scope wins over stale maintenance text in another frame.
+- The first strong ready poll is accepted without a contradictory second probe.
+- The exact GitHub mount regression is covered: when the first probe contains
+  `supportingTextMatches == 1`, the click occurs before any further scroll.
+- GitHub workflow and configuration use headed bundled Chromium under Xvfb.
+- The SQLite state cache and v3 browser-profile cache are independent.
 
-## Live browser limitation in this workspace
+## Browser identity launch validation
 
-A live Fundy Bay diagnosis was attempted. The local execution environment
-blocked navigation to `toronto.ca` with Chromium's
-`net::ERR_BLOCKED_BY_ADMINISTRATOR`, so a successful Toronto network run could
-not be completed here. The failure path correctly returned `failed`, did not
-fabricate document URLs, and generated debug artifacts. GitHub Actions installs
-the pinned Playwright Chromium build and includes a manual `diagnose_url` input
-for the actual deployment test.
+A local Xvfb launch using the packaged `_launch_toronto_context()` completed
+successfully and returned:
 
-## Ready-latch v2 validation
+```text
+mode: bundled-chromium-cdp
+user agent: Mozilla/5.0 ... Chrome/144.0.0.0 Safari/537.36
+navigator.webdriver: false
+```
 
-The regression suite now asserts that a first strong `ready` state is terminal
-even when `_application_widget_probe()` reports false and even when any second
-poll would have become `maintenance`. It also verifies that Supporting
-Documentation is targeted before secondary probing or browser identity logging.
+The package pins Playwright 1.57.0 in `requirements.txt`, so GitHub will use that
+version's bundled Chromium build; the exact Chrome version can differ from the
+local validation environment. The important validated properties are the CDP
+attachment mode, non-HeadlessChrome identity, and `navigator.webdriver=false`.
+
+## Live Toronto limitation in this workspace
+
+This execution environment cannot complete a live Toronto application request,
+so the next GitHub Actions `diagnose_url` run remains the authoritative live
+validation. The expected revision marker is:
+
+```text
+Toronto enrichment revision: 2026-07-17-supporting-click-latch-v3
+```

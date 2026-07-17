@@ -43,10 +43,11 @@ python -m dev_project_monitor.monitor \
 
 ## Toronto browser behaviour
 
-The monitor uses Playwright-bundled Chromium with a persistent native browser
-profile. It waits for Toronto's JavaScript application service, opens only the
-Supporting Documentation accordion, clicks the real Application Form download,
-and rejects legacy AIC folder pages as document links.
+The monitor starts Playwright-bundled Chromium as a normal headed browser under
+Xvfb and attaches over CDP using a persistent profile. It waits for Toronto's
+JavaScript application service, clicks Supporting Documentation at its first
+visible instant, downloads the real Application Form, and rejects legacy AIC
+folder pages as document links.
 
 A failed linked application remains unseen and will be retried. Incomplete
 Toronto results are not notified by default. Diagnostics are written under

@@ -17,6 +17,8 @@ import logging
 import os
 import re
 import shutil
+import socket
+import subprocess
 import smtplib
 import sqlite3
 import sys
@@ -36,7 +38,44 @@ from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
 LOGGER = logging.getLogger("dev_project_monitor")
-TORONTO_ENRICHMENT_REVISION = "2026-07-17-ready-latch-v2"
+TORONTO_ENRICHMENT_REVISION = "2026-07-17-supporting-click-latch-v3"
+
+
+class _TorontoContextHandle:
+    """Delegate a BrowserContext while owning an attached Chromium process."""
+
+    def __init__(self, context: Any, browser: Any = None, process: Any = None) -> None:
+        self._context = context
+        self._browser = browser
+        self._process = process
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._context, name)
+
+    @property
+    def pages(self) -> Any:
+        return self._context.pages
+
+    def close(self) -> None:
+        try:
+            if self._browser is not None:
+                self._browser.close()
+            else:
+                self._context.close()
+        except Exception:
+            pass
+        process = self._process
+        if process is None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "state_db": "data/dev_project_monitor.sqlite3",
@@ -64,6 +103,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "render_with_playwright": True,
         "browser_channel": "chromium",
         "browser_profile_dir": "data/toronto_browser_profile",
+        "browser_launch_mode": "bundled-cdp",
+        "headed": True,
+        "clear_browser_runtime_cache": True,
         "application_service_timeout_seconds": 90,
         "application_service_retries": 3,
         "application_service_poll_ms": 750,
@@ -1138,7 +1180,14 @@ class TorontoOpenDataMonitor:
                     pass
 
     def _launch_toronto_context(self, playwright: Any) -> tuple[Any, dict[str, Any]]:
-        """Launch Playwright's bundled Chromium with one persistent native profile."""
+        """Start bundled Chromium normally, then attach Playwright over CDP.
+
+        Playwright's normal ``launch`` path exposes ``HeadlessChrome`` and
+        ``navigator.webdriver=true``.  The validated local crawler instead
+        attached to an already-running Chrome session.  This CI-safe equivalent
+        starts Playwright's version-matched Chromium as a regular headed process
+        under Xvfb and then connects through its DevTools port.
+        """
         profile_dir = Path(
             self.config.get("browser_profile_dir")
             or self.config.get("playwright_profile_dir")
@@ -1146,22 +1195,125 @@ class TorontoOpenDataMonitor:
         )
         profile_dir.mkdir(parents=True, exist_ok=True)
 
-        # Remove stale Chromium singleton files left by a cancelled CI job.
         for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
             try:
                 (profile_dir / name).unlink(missing_ok=True)
             except Exception:
                 pass
 
-        args = ["--disable-dev-shm-usage"]
-        if os.name != "nt":
-            args.append("--no-sandbox")
+        if self.config.get("clear_browser_runtime_cache", True):
+            for relative in (
+                "Default/Service Worker",
+                "Default/Cache",
+                "Default/Code Cache",
+                "Default/GPUCache",
+                "GrShaderCache",
+                "ShaderCache",
+            ):
+                try:
+                    shutil.rmtree(profile_dir / relative, ignore_errors=True)
+                except Exception:
+                    pass
 
+        launch_mode = normalize_key(
+            self.config.get("browser_launch_mode") or "bundled-cdp"
+        ).lower()
         browser_channel = normalize_key(
             self.config.get("browser_channel") or "chromium"
         ).lower()
+        headed = bool(self.config.get("headed", True))
+
+        if launch_mode == "bundled-cdp" and browser_channel == "chromium":
+            executable = Path(playwright.chromium.executable_path)
+            LOGGER.info("Bundled Chromium executable: %s", executable)
+            if not executable.exists():
+                raise RuntimeError(f"Bundled Chromium executable not found: {executable}")
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+                probe_socket.bind(("127.0.0.1", 0))
+                cdp_port = int(probe_socket.getsockname()[1])
+
+            args = [
+                str(executable),
+                "--remote-debugging-address=127.0.0.1",
+                f"--remote-debugging-port={cdp_port}",
+                f"--user-data-dir={profile_dir.resolve()}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-dev-shm-usage",
+                "--lang=en-CA",
+                "--window-size=1440,1000",
+            ]
+            if os.name != "nt":
+                args.append("--no-sandbox")
+            if not headed:
+                args.append("--headless=new")
+            args.append("about:blank")
+
+            process_env = os.environ.copy()
+            process_env.setdefault("TZ", "America/Toronto")
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=process_env,
+            )
+            endpoint = f"http://127.0.0.1:{cdp_port}"
+            version_info: dict[str, Any] = {}
+            deadline = time.monotonic() + 20
+            try:
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        raise RuntimeError(
+                            f"Bundled Chromium exited before CDP became ready "
+                            f"(code {process.returncode})."
+                        )
+                    try:
+                        response = requests.get(
+                            endpoint + "/json/version", timeout=0.35
+                        )
+                        response.raise_for_status()
+                        version_info = response.json()
+                        break
+                    except Exception:
+                        time.sleep(0.1)
+                else:
+                    raise RuntimeError(
+                        f"Bundled Chromium CDP endpoint did not become ready: {endpoint}"
+                    )
+
+                browser = playwright.chromium.connect_over_cdp(endpoint)
+                if not browser.contexts:
+                    raise RuntimeError("CDP browser did not expose its default context.")
+                context = browser.contexts[0]
+                handle = _TorontoContextHandle(context, browser, process)
+                return handle, {
+                    "mode": "bundled-chromium-cdp",
+                    "browser": "Playwright-bundled Chromium",
+                    "profile_dir": str(profile_dir),
+                    "cdp_endpoint": endpoint,
+                    "browser_version": version_info.get("Browser", ""),
+                    "native_user_agent": True,
+                    "playwright_launch_automation_flag": False,
+                }
+            except Exception:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                raise
+
+        # Explicit compatibility fallback for local users who choose a system
+        # channel or the standard Playwright launch path.
+        args = ["--disable-dev-shm-usage"]
+        if os.name != "nt":
+            args.append("--no-sandbox")
         kwargs: dict[str, Any] = {
-            "headless": not bool(self.config.get("headed", False)),
+            "headless": not headed,
             "accept_downloads": True,
             "locale": "en-CA",
             "timezone_id": "America/Toronto",
@@ -1172,27 +1324,22 @@ class TorontoOpenDataMonitor:
             kwargs["channel"] = browser_channel
             label = f"system {browser_channel}"
         else:
-            # channel omitted means the Chromium binary versioned with this
-            # exact Playwright installation.  Do not override userAgent or
-            # silently substitute another executable.
             label = "Playwright-bundled Chromium"
             LOGGER.info("Bundled Chromium executable: %s", playwright.chromium.executable_path)
-
         try:
             context = playwright.chromium.launch_persistent_context(
-                str(profile_dir.resolve()),
-                **kwargs,
+                str(profile_dir.resolve()), **kwargs
             )
         except Exception as exc:
             raise RuntimeError(
                 f"Could not launch {label} with persistent profile {profile_dir}: {exc}"
             ) from exc
-
-        return context, {
+        return _TorontoContextHandle(context), {
             "mode": "persistent-context",
             "browser": label,
             "profile_dir": str(profile_dir),
             "native_user_agent": True,
+            "playwright_launch_automation_flag": True,
         }
 
     def _application_service_state(self, page: Any) -> str:
@@ -1636,14 +1783,86 @@ class TorontoOpenDataMonitor:
         return totals
 
     def _scroll_until_supporting_docs_mounted(self, page: Any, max_seconds: float | None = None) -> dict[str, int]:
-        """Scroll the main document and relevant frames until the lazy section mounts."""
-        max_seconds = float(max_seconds or self.config.get("supporting_docs_mount_wait_seconds", 9) or 9)
+        """Mount and click Supporting Documentation at the first visible instant.
+
+        On hosted Chromium the Toronto widget can briefly paint the section title
+        and then replace the application with a maintenance shell.  The previous
+        implementation noticed ``supportingTextMatches == 1`` but kept scrolling
+        until the title disappeared.  This loop treats that text as an action
+        signal: click immediately, verify immediately, and only scroll when the
+        section has not appeared at all.
+        """
+        max_seconds = float(
+            max_seconds
+            or self.config.get("supporting_docs_mount_wait_seconds", 9)
+            or 9
+        )
         deadline = time.monotonic() + max_seconds
         best = self._supporting_docs_probe(page)
         step = 0
+        click_attempts = 0
+
         while time.monotonic() < deadline:
-            if best.get("downloadButtons") or best.get("documentRows") or best.get("referenceFileMatches"):
-                break
+            state = self._supporting_documentation_state(page)
+            if state.get("open"):
+                best = self._supporting_docs_probe(page)
+                LOGGER.info(
+                    "Toronto Supporting Documentation opened during mount loop: "
+                    "probe=%s; state=%s",
+                    best,
+                    state,
+                )
+                return best
+
+            if (
+                best.get("downloadButtons")
+                or best.get("documentRows")
+                or best.get("referenceFileMatches")
+            ):
+                return best
+
+            # Critical CI path: the title may exist for less than one second.
+            # Click before another scroll/poll can destroy the mounted widget.
+            if best.get("supportingTextMatches"):
+                click_attempts += 1
+                clicked = self._click_supporting_docs_with_playwright_locators(page)
+                LOGGER.info(
+                    "Toronto Supporting Documentation detected; immediate click %d: "
+                    "clicked=%d; probe=%s",
+                    click_attempts,
+                    clicked,
+                    best,
+                )
+                # Verify in a tight no-scroll window.  DataTable creation may
+                # lag the click by several hundred milliseconds, while another
+                # large scroll would move the only actionable title away.
+                verify_deadline = min(deadline, time.monotonic() + (1.2 if clicked else 0.2))
+                while time.monotonic() < verify_deadline:
+                    try:
+                        page.wait_for_timeout(100)
+                    except Exception:
+                        break
+                    state = self._supporting_documentation_state(page)
+                    best = self._supporting_docs_probe(page)
+                    if state.get("open") or (
+                        best.get("downloadButtons")
+                        or best.get("documentRows")
+                        or best.get("referenceFileMatches")
+                    ):
+                        LOGGER.info(
+                            "Toronto Supporting Documentation immediate click confirmed: "
+                            "probe=%s; state=%s",
+                            best,
+                            state,
+                        )
+                        return best
+                    if not best.get("supportingTextMatches"):
+                        break
+
+                # If the title survived, retry rapidly without scrolling away.
+                if best.get("supportingTextMatches") and click_attempts < 4:
+                    continue
+
             step += 1
             for scope in self._document_scopes(page):
                 try:
@@ -1652,26 +1871,26 @@ class TorontoOpenDataMonitor:
                         () => {
                             const root = document.scrollingElement || document.documentElement || document.body;
                             const vh = window.innerHeight || 900;
-                            if (root) root.scrollTop = Math.min(root.scrollHeight, (root.scrollTop || 0) + Math.max(650, Math.floor(vh * 0.85)));
-                            window.scrollBy(0, Math.max(650, Math.floor(vh * 0.85)));
+                            const delta = Math.max(320, Math.floor(vh * 0.45));
+                            if (root) root.scrollTop = Math.min(root.scrollHeight, (root.scrollTop || 0) + delta);
+                            window.scrollBy(0, delta);
                         }
                         """
                     )
                 except Exception:
                     continue
             try:
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(160)
             except Exception:
                 break
             best = self._supporting_docs_probe(page)
-            if step in {1, 4, 8}:
-                LOGGER.info("Toronto Supporting Documentation mount probe step %s: %s", step, best)
+            if step in {1, 4, 8, 16}:
+                LOGGER.info(
+                    "Toronto Supporting Documentation mount probe step %s: %s",
+                    step,
+                    best,
+                )
 
-        for scope in self._document_scopes(page):
-            try:
-                scope.evaluate("window.scrollTo(0, 0)")
-            except Exception:
-                pass
         LOGGER.info("Toronto Supporting Documentation mount probe final: %s", best)
         return best
 
@@ -1819,10 +2038,12 @@ class TorontoOpenDataMonitor:
         return totals
 
     def _click_supporting_docs_with_playwright_locators(self, page: Any) -> int:
-        """Click one actionable Supporting Documentation control per scope.
+        """Click the exact Supporting Documentation label/control immediately.
 
-        Page-wide ``Expand All`` is intentionally excluded because Toronto can
-        expand every other table while leaving Supporting Documentation closed.
+        The Toronto markup has changed between button, header, div and nested span
+        variants.  Search open shadow roots for the smallest matching label, walk
+        both upward and downward for its actionable control, and finally use a
+        Playwright text locator whose click bubbles through wrapper markup.
         """
         js = r"""
         () => {
@@ -1834,6 +2055,18 @@ class TorontoOpenDataMonitor:
                     return style.display !== 'none' && style.visibility !== 'hidden'
                         && rect.width > 0 && rect.height > 0;
                 } catch (e) { return false; }
+            };
+            const actionable = el => {
+                if (!el) return false;
+                const tag = String(el.tagName || '').toUpperCase();
+                const role = clean(el.getAttribute && el.getAttribute('role')).toLowerCase();
+                return ['BUTTON', 'A', 'SUMMARY'].includes(tag)
+                    || role === 'button'
+                    || !!(el.hasAttribute && (
+                        el.hasAttribute('aria-controls')
+                        || el.hasAttribute('data-bs-toggle')
+                        || el.hasAttribute('data-toggle')
+                    ));
             };
             const roots = [];
             const seenRoots = new Set();
@@ -1847,49 +2080,103 @@ class TorontoOpenDataMonitor:
             addRoot(document);
 
             for (const root of roots) {
-                let labels = [];
-                try {
-                    labels = Array.from(root.querySelectorAll(
-                        'button, a, summary, [role="button"], [aria-controls], .accordion-button, .accordion-header, h2, h3, h4'
-                    ));
-                } catch (e) { labels = []; }
+                let all = [];
+                try { all = Array.from(root.querySelectorAll('*')); } catch (e) { all = []; }
+                const labels = all
+                    .filter(el => {
+                        const text = clean(el.innerText || el.textContent || el.getAttribute?.('aria-label') || '');
+                        return /^Supporting Documentation(?:\s|$)/i.test(text)
+                            && text.length <= 220
+                            && visible(el);
+                    })
+                    .sort((a, b) => {
+                        const at = clean(a.innerText || a.textContent || '').length;
+                        const bt = clean(b.innerText || b.textContent || '').length;
+                        return at - bt;
+                    });
+
                 for (const label of labels) {
-                    const text = clean(label.innerText || label.textContent || label.getAttribute('aria-label') || '');
-                    if (!/\bSupporting Documentation\b/i.test(text) || /Expand All/i.test(text)) continue;
+                    const candidates = [];
+                    if (actionable(label)) candidates.push(label);
 
-                    let target = label;
-                    if (!/^(BUTTON|A|SUMMARY)$/i.test(target.tagName || '')
-                        && clean(target.getAttribute('role')).toLowerCase() !== 'button') {
-                        const nested = target.querySelector && target.querySelector(
-                            'button, a, summary, [role="button"], [aria-controls]'
-                        );
-                        if (nested) target = nested;
-                        else if (target.closest) {
-                            const ancestor = target.closest(
-                                'button, a, summary, [role="button"], [aria-controls]'
+                    let ancestor = label.parentElement;
+                    for (let depth = 0; ancestor && depth < 5; depth++, ancestor = ancestor.parentElement) {
+                        if (actionable(ancestor)) candidates.push(ancestor);
+                        try {
+                            const nested = ancestor.querySelector(
+                                'button, a, summary, [role="button"], [aria-controls], '
+                                + '[data-bs-toggle], [data-toggle]'
                             );
-                            if (ancestor) target = ancestor;
-                        }
+                            if (nested) candidates.push(nested);
+                        } catch (e) {}
                     }
+                    try {
+                        const nested = label.querySelector(
+                            'button, a, summary, [role="button"], [aria-controls], '
+                            + '[data-bs-toggle], [data-toggle]'
+                        );
+                        if (nested) candidates.unshift(nested);
+                    } catch (e) {}
+                    candidates.push(label); // bubbling click fallback
 
-                    const expanded = clean(target.getAttribute('aria-expanded')).toLowerCase();
-                    const cls = clean(target.className).toLowerCase();
-                    if (expanded === 'true' && !/collapsed/.test(cls)) return 0;
-                    if (!visible(target) && !visible(label)) continue;
-                    try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
-                    try { target.click(); return 1; } catch (e) {}
+                    const seen = new Set();
+                    for (const target of candidates) {
+                        if (!target || seen.has(target)) continue;
+                        seen.add(target);
+                        const expanded = clean(target.getAttribute && target.getAttribute('aria-expanded')).toLowerCase();
+                        const cls = clean(target.className).toLowerCase();
+                        if (expanded === 'true' && !/collapsed/.test(cls)) return 0;
+                        if (!visible(target) && !visible(label)) continue;
+                        try { target.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (e) {}
+                        try {
+                            target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                            target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                            target.click();
+                            return 1;
+                        } catch (e) {}
+                    }
                 }
             }
             return 0;
         }
         """
         clicked_total = 0
-        for scope in self._document_scopes(page):
+        scopes = self._document_scopes(page)
+        for scope in scopes:
             try:
                 clicked_total += int(scope.evaluate(js) or 0)
             except Exception:
                 continue
-        return clicked_total
+        if clicked_total:
+            return clicked_total
+
+        # Playwright's text engine pierces open shadow roots.  Clicking the exact
+        # text node also bubbles to accordion wrappers whose click handler is on
+        # a parent rather than on the label itself.
+        exact_pattern = re.compile(r"^\s*Supporting\s+Documentation\s*$", re.I)
+        for scope in scopes:
+            try:
+                locator = scope.get_by_text(exact_pattern)
+                count = min(int(locator.count()), 8)
+            except Exception:
+                continue
+            for index in range(count):
+                candidate = locator.nth(index)
+                try:
+                    if not candidate.is_visible(timeout=150):
+                        continue
+                except Exception:
+                    continue
+                try:
+                    candidate.scroll_into_view_if_needed(timeout=300)
+                except Exception:
+                    pass
+                try:
+                    candidate.click(timeout=600, force=True)
+                    return 1
+                except Exception:
+                    continue
+        return 0
 
     def _force_supporting_docs_visible(self, page: Any) -> None:
         """Compatibility helper that performs only the safe targeted click."""
