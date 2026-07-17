@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import smtplib
 import sqlite3
 import sys
@@ -59,6 +60,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dry_run_max_detail_pages": 5,
         "raw_record_limit": 0,
         "render_with_playwright": True,
+        "require_dynamic_application_widget": True,
+        "application_widget_wait_seconds": 30,
+        "document_api_replay_timeout_ms": 7000,
+        "save_debug_artifacts_on_failure": True,
+        "debug_artifacts_dir": "data/toronto_debug",
         "page_timeout_ms": 60000,
         "post_load_wait_ms": 2500,
         "ocr_image_pdfs": True,
@@ -321,6 +327,18 @@ class StateStore:
             (source, item_key, utcnow().isoformat(), payload_hash),
         )
         self.conn.commit()
+
+    def delete_seen(self, source: str, item_keys: Iterable[str]) -> int:
+        keys = [normalize_key(key) for key in item_keys if normalize_key(key)]
+        deleted = 0
+        for key in keys:
+            cur = self.conn.execute(
+                "DELETE FROM seen_items WHERE source = ? AND item_key = ?",
+                (source, key),
+            )
+            deleted += int(cur.rowcount or 0)
+        self.conn.commit()
+        return deleted
 
 
 @dataclasses.dataclass
@@ -885,216 +903,516 @@ class TorontoOpenDataMonitor:
         )
 
     def _fetch_rendered_page(self, url: str) -> tuple[str, str]:
-        """Render Toronto application page and expand/capture Supporting Documentation."""
-        if self.config.get("render_with_playwright", True):
-            try:
-                from playwright.sync_api import sync_playwright
+        """Render and verify the Toronto application widget before enrichment.
 
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
-                    browser_user_agent = self.config.get("browser_user_agent") or (
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    )
-                    context = browser.new_context(
-                        viewport={"width": 1365, "height": 2400},
-                        user_agent=browser_user_agent,
-                        accept_downloads=True,
-                        locale="en-CA",
+        The WordPress page returned by ``requests`` contains only a static shell
+        with the word ``Loading``.  Treating that shell as a successful detail
+        page caused every supporting document and Application Form contact to be
+        reported as ``Not found``.  Toronto enrichment therefore requires a
+        functioning browser and a positive widget-readiness probe.
+        """
+        if not self.config.get("render_with_playwright", True):
+            raise RuntimeError(
+                "Toronto application details are JavaScript-rendered; "
+                "render_with_playwright must remain enabled."
+            )
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise RuntimeError(
+                "Playwright is not installed. Install it and Chromium with: "
+                "pip install playwright && python -m playwright install chromium"
+            ) from exc
+
+        diagnostics: dict[str, Any] = {"requested_url": url}
+        with sync_playwright() as p:
+            browser, launch_info = self._launch_toronto_browser(p)
+            diagnostics["browser_launch"] = launch_info
+            browser_user_agent = self.config.get("browser_user_agent") or (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            context = browser.new_context(
+                viewport={"width": 1365, "height": 2400},
+                user_agent=browser_user_agent,
+                accept_downloads=True,
+                locale="en-CA",
+            )
+            page = context.new_page()
+            page.set_default_timeout(int(self.config.get("playwright_default_timeout_ms", 1800) or 1800))
+            page.set_default_navigation_timeout(int(self.config.get("page_timeout_ms", 60000) or 60000))
+            network_recorder = self._install_toronto_network_recorder(page)
+
+            try:
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=int(self.config.get("page_timeout_ms", 60000)),
+                )
+                try:
+                    page.wait_for_load_state("networkidle", timeout=3500)
+                except Exception:
+                    pass
+                page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
+
+                # Some legacy links redirect to the canonical id/pid/title URL.
+                normalized_start = self._application_details_url(url) or html.unescape(normalize_key(url))
+                normalized_current = self._application_details_url(page.url) or html.unescape(normalize_key(page.url))
+                if (
+                    normalized_current
+                    and normalized_current != normalized_start
+                    and "id=" in normalized_current
+                    and "pid=" in normalized_current
+                ):
+                    LOGGER.info("Toronto render canonical reload: %s -> %s", normalized_start, normalized_current)
+                    page.goto(
+                        normalized_current,
+                        wait_until="domcontentloaded",
+                        timeout=int(self.config.get("page_timeout_ms", 60000)),
                     )
                     try:
-                        page = context.new_page()
-                        page.set_default_timeout(int(self.config.get("playwright_default_timeout_ms", 1800) or 1800))
-                        page.set_default_navigation_timeout(int(self.config.get("page_timeout_ms", 60000) or 60000))
-                        network_recorder = self._install_toronto_network_recorder(page)
+                        page.wait_for_load_state("networkidle", timeout=3500)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
 
-                        page.goto(
-                            url,
-                            wait_until="domcontentloaded",
-                            timeout=int(self.config.get("page_timeout_ms", 60000)),
-                        )
+                widget_probe = self._wait_for_application_widget(page)
+                diagnostics["widget_probe"] = widget_probe
+                if not widget_probe.get("ready"):
+                    debug_path = self._save_toronto_debug_artifacts(
+                        page, network_recorder, diagnostics, "widget_not_ready"
+                    )
+                    raise RuntimeError(
+                        "Toronto application widget did not finish loading. "
+                        f"The static page shell was detected instead of application data. "
+                        f"Debug artifacts: {debug_path or 'not saved'}"
+                    )
 
-                        # Do not wait a long time for networkidle. The Toronto page can keep
-                        # analytics/API requests open, and this monitor only needs the rendered
-                        # Supporting Documentation table.
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=3000)
-                        except Exception:
-                            pass
+                mount_probe = self._scroll_until_supporting_docs_mounted(page)
+                diagnostics["supporting_docs_mount_probe"] = mount_probe
+                self._expand_supporting_documentation(page)
+                for scope in self._document_scopes(page):
+                    self._set_document_table_to_all_rows(scope)
 
-                        page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
+                # Trigger lazy content in the main page and any application frame.
+                for scope in self._document_scopes(page):
+                    try:
+                        scope.evaluate("window.scrollTo(0, document.body ? document.body.scrollHeight : 0)")
+                    except Exception:
+                        pass
+                page.wait_for_timeout(800)
 
-                        # Legacy folderRsn links often client-redirect to the current id/pid/title URL.
-                        # Reload that canonical URL once so the Angular app initializes from the
-                        # same URL shape a human browser uses when opening the page directly.
-                        try:
-                            normalized_start = self._application_details_url(url) or html.unescape(normalize_key(url))
-                            normalized_current = self._application_details_url(page.url) or html.unescape(normalize_key(page.url))
-                            if (
-                                normalized_current
-                                and normalized_current != normalized_start
-                                and "id=" in normalized_current
-                                and "pid=" in normalized_current
-                            ):
-                                LOGGER.info("Toronto render canonical reload: %s -> %s", normalized_start, normalized_current)
-                                page.goto(normalized_current, wait_until="domcontentloaded", timeout=int(self.config.get("page_timeout_ms", 60000)))
-                                try:
-                                    page.wait_for_load_state("networkidle", timeout=3000)
-                                except Exception:
-                                    pass
-                                page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
-                        except Exception as exc:
-                            LOGGER.info("Toronto canonical reload skipped for %s: %s", url, exc)
+                final_url = page.url
+                network_links, network_available = self._extract_network_document_data(
+                    network_recorder, final_url
+                )
+                replay_links, replay_available, replay_diagnostics = self._replay_document_api_requests(
+                    context, network_recorder, final_url
+                )
+                diagnostics["document_api_replay"] = replay_diagnostics
+                for name in replay_available:
+                    network_available.add(name)
+                for name, href in replay_links.items():
+                    if href and not network_links.get(name):
+                        network_links[name] = href
 
-                        # A valid Toronto application page usually shows these labels, but do not
-                        # fail here: the app can render the document table before all labels settle.
-                        try:
-                            page.locator("body").filter(
-                                has_text=re.compile(
-                                    r"Application Number|Application Status|Supporting Documentation|Reference File|Download",
-                                    re.I,
-                                )
-                            ).wait_for(timeout=8000)
-                        except Exception:
-                            pass
+                button_links, button_available = self._wait_for_toronto_download_rows(page, final_url)
 
-                        # The AIC app lazily mounts lower-page sections. Scroll first;
-                        # otherwise the Supporting Documentation header/table may not
-                        # exist yet and all clicks become no-ops.
-                        mount_probe = self._scroll_until_supporting_docs_mounted(page)
-                        if not (mount_probe.get("downloadButtons") or mount_probe.get("supportingTextMatches") or mount_probe.get("referenceFileMatches")):
-                            LOGGER.info("Toronto Supporting Documentation not mounted after scroll probe; continuing with bounded fallback")
-
-                        self._expand_supporting_documentation(page)
-
-                        for scope in self._document_scopes(page):
-                            try:
-                                self._set_document_table_to_all_rows(scope)
-                            except Exception as exc:
-                                LOGGER.info("Could not switch document table to all/100 entries for %s: %s", url, exc)
-
-                        # Scroll so lazy-rendered table content appears.
-                        try:
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            page.wait_for_timeout(1000)
-                        except Exception:
-                            pass
-
-                        final_url = page.url
-                        network_links, network_available = self._extract_network_document_data(network_recorder, final_url)
-
-                        # The reliable City signal is the exact row contract:
-                        # first <td> = Reference File and fourth <td> contains
-                        # button.downloadFile[data-id]. Wait/poll specifically for
-                        # that contract before falling back to broad HTML parsing.
-                        button_links, button_available = self._wait_for_toronto_download_rows(page, final_url)
-
-                        # If DataTables is server-side or still paginating, use its own
-                        # search box for each standardized file name. This is still fast:
-                        # it does not click downloads; it only inspects first-td +
-                        # button.downloadFile[data-id] rows after each search.
-                        missing_button_names = [name for name in self.REQUIRED_DOCUMENTS if name not in button_available]
-                        search_probe = self._supporting_docs_probe(page)
-                        if missing_button_names and not (search_probe.get("downloadButtons") or search_probe.get("supportingTextMatches") or search_probe.get("referenceFileMatches")):
-                            LOGGER.info("Toronto document search skipped because document UI is not mounted for %s: %s", final_url, search_probe)
-                            missing_button_names = []
-                        if missing_button_names:
-                            search_terms = {
-                                "Application Form": ["Application Form"],
-                                "Architectural Plans": ["Architectural Plans", "Architectural"],
-                                "Civil and Utilities Plans": ["Civil and Utilities Plans", "Civil", "Utilities", "Servicing"],
-                                "Geotechnical Study": ["Geotechnical Study", "Geotechnical"],
-                                "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology"],
-                            }
-                            for required_name in missing_button_names:
-                                if required_name in button_available:
-                                    continue
-                                for term in search_terms.get(required_name, [required_name]):
-                                    for scope in self._document_scopes(page):
-                                        try:
-                                            self._set_document_table_to_all_rows(scope, term)
-                                        except Exception:
-                                            pass
-                                    self._force_supporting_docs_visible(page)
-                                    more_links, more_available = self._extract_download_button_document_rows(page, final_url)
-                                    for name in more_available:
-                                        button_available.add(name)
-                                    for name, href in more_links.items():
-                                        if href and not button_links.get(name):
-                                            button_links[name] = href
-                                    if required_name in button_available:
-                                        break
-
+                # Search the DataTable only after the widget and section are proven ready.
+                missing_names = [name for name in self.REQUIRED_DOCUMENTS if name not in button_available]
+                if missing_names:
+                    search_terms = {
+                        "Application Form": ["Application Form", "Application"],
+                        "Architectural Plans": ["Architectural Plans", "Architectural", "Floor Plan", "Elevation"],
+                        "Civil and Utilities Plans": ["Civil and Utilities", "Civil", "Utilities", "Servicing", "Grading", "Stormwater"],
+                        "Geotechnical Study": ["Geotechnical Study", "Geotechnical", "Soil"],
+                        "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater", "Dewatering"],
+                    }
+                    for required_name in missing_names:
+                        for term in search_terms.get(required_name, [required_name]):
                             for scope in self._document_scopes(page):
-                                try:
-                                    self._set_document_table_to_all_rows(scope)
-                                except Exception:
-                                    pass
+                                self._set_document_table_to_all_rows(scope, term)
+                            self._force_supporting_docs_visible(page)
+                            more_links, more_available = self._extract_download_button_document_rows(page, final_url)
+                            button_available.update(more_available)
+                            for name, href in more_links.items():
+                                if href and not button_links.get(name):
+                                    button_links[name] = href
+                            if required_name in button_available:
+                                break
+                    for scope in self._document_scopes(page):
+                        self._set_document_table_to_all_rows(scope)
 
-                        # Fast path: do not click Download buttons except later for the
-                        # Application Form contact PDF. Toronto exposes document identity
-                        # as button.downloadFile[data-id], so prefer exact row-token links.
-                        document_links = dict(network_links)
-                        for name, href in button_links.items():
-                            if href and not document_links.get(name):
-                                document_links[name] = href
+                document_links = dict(network_links)
+                for name, href in button_links.items():
+                    if href and not document_links.get(name):
+                        document_links[name] = href
 
-                        visible_available = self._document_names_visible_on_page(page)
-                        available_names = (
-                            set(network_available)
-                            | set(button_available)
-                            | set(visible_available)
-                            | set(document_links)
-                        )
-
-                        html_text = self._combined_page_content(page)
-                        html_text += self._download_links_fixture_html(document_links, available_names, final_url)
-
-                        try:
-                            doc_row_count = sum(self._document_row_count(scope) for scope in self._document_scopes(page))
-                        except Exception:
-                            doc_row_count = "unknown"
-
-                        application_form_text = ""
-                        if self.config.get("extract_application_form_contacts", True) and "Application Form" in available_names:
-                            application_form_text = self._extract_application_form_text_from_page(page, final_url)
-                            if application_form_text:
-                                html_text += self._application_form_text_fixture_html(application_form_text)
-
-                        LOGGER.info("Rendered Toronto detail page length for %s: %s", final_url, len(html_text or ""))
-                        LOGGER.info(
-                            "Supporting Documentation for %s: rows=%s; direct_links=%s; available_rows=%s; application_form_text=%s; names=%s",
-                            final_url,
-                            doc_row_count,
-                            len(document_links),
-                            len(available_names),
-                            bool(normalize_key(application_form_text)),
-                            ", ".join(sorted(available_names)) or "none",
-                        )
-
-                        return final_url, html_text
-                    finally:
-                        context.close()
-                        browser.close()
-
-            except Exception as exc:
-                LOGGER.info(
-                    "Playwright render unavailable for %s; falling back to requests: %s",
-                    url,
-                    exc,
+                visible_available = self._document_names_visible_on_page(page)
+                available_names = (
+                    set(network_available)
+                    | set(button_available)
+                    | set(visible_available)
+                    | set(document_links)
                 )
 
-        response = self.http.get(url)
-        return response.url, response.text
+                html_text = self._combined_page_content(page)
+                html_text += self._download_links_fixture_html(document_links, available_names, final_url)
+
+                application_form_text = ""
+                if self.config.get("extract_application_form_contacts", True) and "Application Form" in available_names:
+                    application_form_text = self._extract_application_form_text_from_page(page, final_url)
+                    if not normalize_key(application_form_text):
+                        direct_form_url = document_links.get("Application Form")
+                        if direct_form_url:
+                            try:
+                                file_bytes = self._read_browser_url_bytes(
+                                    page,
+                                    direct_form_url,
+                                    int(self.config.get("application_form_download_timeout_ms", 12000) or 12000),
+                                )
+                                application_form_text = self._extract_application_form_text_from_bytes(
+                                    file_bytes,
+                                    urlparse(direct_form_url).path.rsplit("/", 1)[-1],
+                                )
+                            except Exception as exc:
+                                LOGGER.info("Direct Application Form browser read failed for %s: %s", final_url, exc)
+                    if normalize_key(application_form_text):
+                        html_text += self._application_form_text_fixture_html(application_form_text)
+
+                final_probe = self._supporting_docs_probe(page)
+                diagnostics.update(
+                    {
+                        "final_url": final_url,
+                        "final_supporting_docs_probe": final_probe,
+                        "available_document_names": sorted(available_names),
+                        "direct_document_links": sorted(document_links),
+                        "application_form_text_chars": len(application_form_text or ""),
+                    }
+                )
+
+                # A loaded application may legitimately have no published documents,
+                # but only when the Supporting Documentation section itself was found.
+                if not available_names and not (
+                    final_probe.get("supportingTextMatches")
+                    or final_probe.get("referenceFileMatches")
+                    or mount_probe.get("supportingTextMatches")
+                    or mount_probe.get("referenceFileMatches")
+                ):
+                    debug_path = self._save_toronto_debug_artifacts(
+                        page, network_recorder, diagnostics, "supporting_section_missing"
+                    )
+                    raise RuntimeError(
+                        "Application data loaded, but the Supporting Documentation section "
+                        "was never detected. This is a render/API failure, not proof that no "
+                        f"documents exist. Debug artifacts: {debug_path or 'not saved'}"
+                    )
+
+                LOGGER.info(
+                    "Supporting Documentation for %s: direct_links=%s; available_rows=%s; "
+                    "application_form_text=%s; names=%s",
+                    final_url,
+                    len(document_links),
+                    len(available_names),
+                    bool(normalize_key(application_form_text)),
+                    ", ".join(sorted(available_names)) or "none",
+                )
+                return final_url, html_text
+            except Exception:
+                # Save diagnostics before closing the browser. The exception is
+                # intentionally propagated; never fall back to the static shell.
+                try:
+                    self._save_toronto_debug_artifacts(
+                        page, network_recorder, diagnostics, "render_exception"
+                    )
+                except Exception:
+                    pass
+                raise
+            finally:
+                try:
+                    context.close()
+                finally:
+                    browser.close()
+
+    def _launch_toronto_browser(self, playwright: Any) -> tuple[Any, dict[str, Any]]:
+        """Launch bundled Chromium, then a known system Chromium if necessary."""
+        attempts: list[str] = []
+        common_args = ["--disable-dev-shm-usage"]
+        if os.name != "nt":
+            common_args.append("--no-sandbox")
+
+        try:
+            browser = playwright.chromium.launch(headless=True, args=common_args)
+            return browser, {"mode": "playwright-bundled", "attempts": attempts}
+        except Exception as exc:
+            attempts.append(f"bundled Chromium: {exc}")
+
+        explicit = normalize_key(os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"))
+        candidates = [explicit] if explicit else []
+        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome", "msedge"):
+            path = shutil.which(name)
+            if path and path not in candidates:
+                candidates.append(path)
+
+        for executable in candidates:
+            try:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    executable_path=executable,
+                    args=common_args,
+                )
+                return browser, {
+                    "mode": "system-chromium",
+                    "executable": executable,
+                    "attempts": attempts,
+                }
+            except Exception as exc:
+                attempts.append(f"{executable}: {exc}")
+
+        joined = " | ".join(shorten(value, 350) for value in attempts)
+        raise RuntimeError(
+            "No usable Chromium browser could be launched for Toronto's dynamic page. "
+            "Run `python -m playwright install chromium` or set "
+            "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH. Attempts: " + joined
+        )
+
+    def _application_widget_probe(self, page: Any) -> dict[str, Any]:
+        """Probe all relevant scopes, including open shadow roots."""
+        details: list[dict[str, Any]] = []
+        marker_count = 0
+        strong_marker_count = 0
+        js = r"""
+        () => {
+            const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+            const roots = [];
+            const seen = new Set();
+            const addRoot = root => {
+                if (!root || seen.has(root)) return;
+                seen.add(root); roots.push(root);
+                let nodes = [];
+                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
+                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
+            };
+            addRoot(document);
+            const parts = [];
+            for (const root of roots) {
+                try { parts.push(clean(root.innerText || root.textContent || '')); } catch (e) {}
+            }
+            const text = clean(parts.join(' '));
+            const markers = {
+                applicationNumber: /Application\s+Number|Reference\s+File/i.test(text),
+                applicationStatus: /Application\s+Status/i.test(text),
+                supportingDocumentation: /Supporting\s+Documentation/i.test(text),
+                referenceFile: /Reference\s+File/i.test(text),
+                proposal: /Proposal|Application\s+Description/i.test(text),
+                numberedApplication: /\b\d{2}\s+\d{5,7}\b/.test(text),
+            };
+            return {
+                url: location.href,
+                title: document.title || '',
+                textLength: text.length,
+                loadingOnly: /^\s*Loading\s*$/i.test(text) || (text.length < 250 && /Loading/i.test(text)),
+                markers,
+                iframeCount: document.querySelectorAll('iframe').length,
+                sample: text.slice(0, 800),
+            };
+        }
+        """
+        for scope in self._document_scopes(page):
+            try:
+                result = scope.evaluate(js) or {}
+            except Exception as exc:
+                details.append({"url": normalize_key(getattr(scope, "url", "")), "error": shorten(str(exc), 250)})
+                continue
+            markers = result.get("markers") if isinstance(result.get("markers"), dict) else {}
+            count = sum(1 for value in markers.values() if value)
+            marker_count += count
+            strong_marker_count += sum(
+                1 for key in ("applicationNumber", "applicationStatus", "supportingDocumentation", "referenceFile")
+                if markers.get(key)
+            )
+            details.append(result)
+        ready = strong_marker_count >= 1 or marker_count >= 2
+        return {
+            "ready": ready,
+            "marker_count": marker_count,
+            "strong_marker_count": strong_marker_count,
+            "scope_count": len(details),
+            "scopes": details,
+        }
+
+    def _wait_for_application_widget(self, page: Any) -> dict[str, Any]:
+        timeout_seconds = float(self.config.get("application_widget_wait_seconds", 30) or 30)
+        deadline = time.monotonic() + timeout_seconds
+        best: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            best = self._application_widget_probe(page)
+            if best.get("ready"):
+                LOGGER.info(
+                    "Toronto application widget ready: scopes=%s markers=%s",
+                    best.get("scope_count"),
+                    best.get("marker_count"),
+                )
+                return best
+            try:
+                page.wait_for_timeout(750)
+            except Exception:
+                break
+        LOGGER.warning("Toronto application widget readiness timed out: %s", best)
+        return best
+
+    def _safe_debug_slug(self, value: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", normalize_key(value)).strip("_")
+        return slug[:80] or "toronto_application"
+
+    def _save_toronto_debug_artifacts(
+        self,
+        page: Any,
+        recorder: dict[str, Any],
+        diagnostics: dict[str, Any],
+        reason: str,
+    ) -> str:
+        if not self.config.get("save_debug_artifacts_on_failure", True):
+            return ""
+        root = self.config.get("debug_artifacts_dir", "data/toronto_debug")
+        timestamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+        slug = self._safe_debug_slug(urlparse(normalize_key(getattr(page, "url", ""))).query or reason)
+        out_dir = os.path.abspath(os.path.join(root, f"{timestamp}_{slug}_{self._safe_debug_slug(reason)}"))
+        os.makedirs(out_dir, exist_ok=True)
+
+        payload = dict(diagnostics or {})
+        payload["reason"] = reason
+        payload["page_url"] = normalize_key(getattr(page, "url", ""))
+        payload["network"] = recorder
+        try:
+            payload["final_widget_probe"] = self._application_widget_probe(page)
+            payload["final_supporting_docs_probe"] = self._supporting_docs_probe(page)
+        except Exception:
+            pass
+        with open(os.path.join(out_dir, "diagnostics.json"), "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+
+        try:
+            page.screenshot(path=os.path.join(out_dir, "page.png"), full_page=True, timeout=8000)
+        except Exception as exc:
+            LOGGER.info("Could not save Toronto debug screenshot: %s", exc)
+        try:
+            with open(os.path.join(out_dir, "main_page.html"), "w", encoding="utf-8") as fh:
+                fh.write(page.content())
+        except Exception:
+            pass
+        for index, scope in enumerate(self._document_scopes(page)):
+            try:
+                with open(os.path.join(out_dir, f"scope_{index}.html"), "w", encoding="utf-8") as fh:
+                    fh.write(scope.content())
+            except Exception:
+                continue
+        LOGGER.warning("Toronto debug artifacts saved to %s", out_dir)
+        return out_dir
+
+    def _replay_document_api_requests(
+        self,
+        context: Any,
+        recorder: dict[str, Any],
+        base_url: str,
+    ) -> tuple[dict[str, str], set[str], dict[str, Any]]:
+        """Replay bounded XHR/fetch requests through the browser session.
+
+        Reading retained Playwright ``Response`` bodies can hang. Replaying the
+        already-completed request through ``context.request`` shares browser
+        cookies, has an explicit timeout, and exposes JSON document metadata even
+        when the DataTable is virtualized or hidden in an iframe.
+        """
+        links: dict[str, str] = {}
+        available: set[str] = set()
+        attempts: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        timeout_ms = int(self.config.get("document_api_replay_timeout_ms", 7000) or 7000)
+        requests_meta = recorder.get("requests", []) if isinstance(recorder, dict) else []
+
+        for item in requests_meta[:120]:
+            if len(attempts) >= 30 or not isinstance(item, dict):
+                break
+            url = normalize_key(item.get("url"))
+            method = normalize_key(item.get("method") or "GET").upper()
+            post_data = item.get("post_data")
+            resource_type = normalize_key(item.get("resource_type")).lower()
+            if not url or self._is_static_asset_url(url):
+                continue
+            lowered = url.lower()
+            relevant = resource_type in {"xhr", "fetch"} and (
+                method != "GET"
+                or any(token in lowered for token in (
+                    "application", "aic", "document", "attachment", "file",
+                    "folder", "submission", "support", "planning",
+                ))
+            )
+            if not relevant:
+                continue
+            key = (method, url, normalize_key(post_data))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            request_headers: dict[str, str] = {
+                "accept": "application/json,text/plain,text/html,*/*",
+                "referer": base_url,
+            }
+            content_type = normalize_key(item.get("content_type"))
+            if content_type:
+                request_headers["content-type"] = content_type
+            record: dict[str, Any] = {"method": method, "url": url}
+            try:
+                kwargs: dict[str, Any] = {
+                    "method": method,
+                    "headers": request_headers,
+                    "timeout": timeout_ms,
+                    "fail_on_status_code": False,
+                }
+                if method not in {"GET", "HEAD"} and post_data not in (None, ""):
+                    kwargs["data"] = post_data
+                response = context.request.fetch(url, **kwargs)
+                record["status"] = response.status
+                response_headers = {str(k).lower(): str(v) for k, v in (response.headers or {}).items()}
+                record["content_type"] = response_headers.get("content-type", "")
+                if response.status >= 400:
+                    attempts.append(record)
+                    continue
+                body = response.body()
+                if len(body) > 3_000_000:
+                    record["skipped"] = f"body too large: {len(body)}"
+                    attempts.append(record)
+                    continue
+                try:
+                    text = body.decode("utf-8", errors="replace")
+                except Exception:
+                    text = body.decode("latin-1", errors="replace")
+                found_links, found_available = self._extract_document_data_from_text(text, url, base_url)
+                available.update(found_available)
+                for name, href in found_links.items():
+                    if href and not links.get(name):
+                        links[name] = href
+                record["found"] = sorted(found_available)
+                record["body_chars"] = len(text)
+            except Exception as exc:
+                record["error"] = shorten(str(exc), 350)
+            attempts.append(record)
+
+        if available:
+            LOGGER.info(
+                "Toronto document API replay found: %s",
+                ", ".join(sorted(available)),
+            )
+        return links, available, {"attempts": attempts, "found": sorted(available)}
 
     def _document_scopes(self, page: Any) -> list[Any]:
-        """Return stable scopes containing the Toronto application widget.
+        """Return the main page plus a bounded set of non-analytics child frames.
 
-        The current City page may mount the application UI in a same-site iframe.
-        Earlier code ignored child frames by default, which made the Supporting
-        Documentation table invisible. Keep the main page and selected City/AIC
-        frames, while excluding analytics, survey, advertising and translation
-        frames that frequently detach.
+        The Toronto widget host/domain has changed more than once.  Requiring a
+        frame URL to contain words such as ``aic`` or ``application`` can silently
+        exclude the real widget.  Exclude only known noise frames and inspect up
+        to eight remaining frames.
         """
         scopes: list[Any] = [page]
         if not self.config.get("inspect_child_frames", True):
@@ -1103,14 +1421,16 @@ class TorontoOpenDataMonitor:
         deny_tokens = (
             "googletagmanager", "google-analytics", "doubleclick", "medallia",
             "youtube", "facebook", "twitter", "translate.google", "recaptcha",
+            "qualtrics", "hotjar",
         )
-        allow_tokens = ("toronto", "aic", "application", "planning", "secure")
         try:
             frames = list(page.frames)
         except Exception:
             return scopes
 
         for frame in frames:
+            if len(scopes) >= 9:
+                break
             try:
                 if frame is page.main_frame or frame.is_detached():
                     continue
@@ -1118,8 +1438,6 @@ class TorontoOpenDataMonitor:
             except Exception:
                 continue
             if any(token in frame_url for token in deny_tokens):
-                continue
-            if frame_url and frame_url != "about:blank" and not any(token in frame_url for token in allow_tokens):
                 continue
             scopes.append(frame)
         return scopes
@@ -1569,13 +1887,27 @@ class TorontoOpenDataMonitor:
             return 0
 
     def _install_toronto_network_recorder(self, page: Any) -> dict[str, Any]:
-        """Record lightweight response metadata only.
+        """Record bounded request and response metadata for safe API replay."""
+        recorder: dict[str, Any] = {"requests": [], "responses": [], "download_urls": []}
 
-        Retaining Playwright Response objects and later calling response.text()
-        can block while a streaming/unfinished response is still open. Metadata is
-        sufficient to recognize direct PDF/download URLs without that risk.
-        """
-        recorder: dict[str, Any] = {"responses": [], "download_urls": []}
+        def on_request(request: Any) -> None:
+            try:
+                url = normalize_key(request.url)
+                if self._is_static_asset_url(url):
+                    return
+                headers = request.headers or {}
+                item = {
+                    "url": url,
+                    "method": normalize_key(request.method),
+                    "resource_type": normalize_key(request.resource_type),
+                    "post_data": request.post_data,
+                    "content_type": normalize_key(headers.get("content-type", "")),
+                }
+                rows = recorder.setdefault("requests", [])
+                if len(rows) < 500:
+                    rows.append(item)
+            except Exception:
+                return
 
         def on_response(response: Any) -> None:
             try:
@@ -1583,9 +1915,14 @@ class TorontoOpenDataMonitor:
                 url = normalize_key(response.url)
                 request = getattr(response, "request", None)
                 resource_type = normalize_key(getattr(request, "resource_type", "")) if request else ""
-                item = {"url": url, "headers": headers, "resource_type": resource_type}
+                item = {
+                    "url": url,
+                    "status": getattr(response, "status", None),
+                    "headers": headers,
+                    "resource_type": resource_type,
+                }
                 responses = recorder.setdefault("responses", [])
-                if len(responses) < 400:
+                if len(responses) < 500:
                     responses.append(item)
                 if self._response_looks_like_download(url, headers):
                     recorder.setdefault("download_urls", []).append(url)
@@ -1593,6 +1930,7 @@ class TorontoOpenDataMonitor:
                 return
 
         try:
+            page.on("request", on_request)
             page.on("response", on_response)
         except Exception:
             pass
@@ -2770,11 +3108,12 @@ class TorontoOpenDataMonitor:
         return self._parse_application_form_contacts(text)
 
     def _extract_pdf_text(self, pdf_bytes: bytes) -> str:
-        """Extract page-1 owner/applicant data from the lower portion of the form.
+        """Extract page-1 owner/applicant data using text, geometry and widgets.
 
-        Work is deliberately bounded: one page, at most 250 widgets, and OCR with
-        a hard timeout. This prevents malformed fillable PDFs or Tesseract from
-        holding the entire monitor indefinitely.
+        Toronto's form places the owner and applicant blocks in the lower part
+        of page 1, but PDF reading order is often poor.  This method keeps the
+        lower-page extraction requested by the monitor, while also creating
+        label/value pairs from field geometry and AcroForm widgets before OCR.
         """
         text_parts: list[str] = []
         doc = None
@@ -2787,45 +3126,105 @@ class TorontoOpenDataMonitor:
             page = doc[0]
             page_rect = page.rect
             ratio = float(self.config.get("application_form_lower_start_ratio", 0.42) or 0.42)
-            ratio = min(0.70, max(0.30, ratio))
-            lower = fitz.Rect(page_rect.x0, page_rect.y0 + page_rect.height * ratio, page_rect.x1, page_rect.y1)
+            ratio = min(0.72, max(0.28, ratio))
+            lower = fitz.Rect(
+                page_rect.x0,
+                page_rect.y0 + page_rect.height * ratio,
+                page_rect.x1,
+                page_rect.y1,
+            )
 
-            # Sorted words preserve form rows better than plain text extraction.
-            words = page.get_text("words", clip=lower, sort=True) or []
-            line_groups: dict[tuple[int, int], list[tuple[float, str]]] = {}
-            for word in words[:5000]:
-                if len(word) < 8:
-                    continue
-                x0, _y0, _x1, _y1, value, block_no, line_no, _word_no = word[:8]
-                line_groups.setdefault((int(block_no), int(line_no)), []).append((float(x0), str(value)))
-            if line_groups:
-                ordered_lines = [
-                    " ".join(value for _x, value in sorted(parts, key=lambda item: item[0]))
-                    for _key, parts in sorted(line_groups.items(), key=lambda item: item[0])
-                ]
-                text_parts.append("\n".join(ordered_lines))
-            else:
-                text_parts.append(page.get_text("text", clip=lower, sort=True))
+            full_text = page.get_text("text", sort=True) or ""
+            lower_text = page.get_text("text", clip=lower, sort=True) or ""
+            if normalize_key(lower_text):
+                text_parts.append(lower_text)
+            # Keep the complete first page as a secondary source because some
+            # form revisions move the owner heading slightly above the cutoff.
+            if normalize_key(full_text) and normalize_key(full_text) != normalize_key(lower_text):
+                text_parts.append("FULL PAGE 1\n" + full_text)
 
-            # Walk the linked widget list with an explicit cap instead of an
-            # unbounded generator over potentially malformed form objects.
+            def first_label_y(patterns: tuple[str, ...], minimum_y: float = 0.0) -> float | None:
+                hits: list[float] = []
+                for pattern in patterns:
+                    try:
+                        for rect in page.search_for(pattern):
+                            if rect.y0 >= minimum_y:
+                                hits.append(float(rect.y0))
+                    except Exception:
+                        continue
+                return min(hits) if hits else None
+
+            owner_y = first_label_y(("Registered Owner", "Property Owner", "Owner(s)"), lower.y0 - 40)
+            applicant_y = first_label_y(("Applicant Name", "Applicant Information", "Applicant/Agent"), lower.y0 - 40)
+            owner_start = owner_y if owner_y is not None else lower.y0
+            owner_end = applicant_y if applicant_y is not None and applicant_y > owner_start else page_rect.y1
+            applicant_start = applicant_y if applicant_y is not None else lower.y0
+            applicant_end = page_rect.y1
+
+            def field_value_near_label(label: str, y_start: float, y_end: float) -> str:
+                try:
+                    rects = [rect for rect in page.search_for(label) if rect.y0 >= y_start - 3 and rect.y1 <= y_end + 3]
+                except Exception:
+                    rects = []
+                for rect in rects[:5]:
+                    same_line = fitz.Rect(
+                        min(page_rect.x1, rect.x1 + 3),
+                        max(page_rect.y0, rect.y0 - 2),
+                        page_rect.x1,
+                        min(page_rect.y1, rect.y1 + 5),
+                    )
+                    value = normalize_key(page.get_text("text", clip=same_line, sort=True))
+                    value = re.sub(r"^(?:[:\-]|Name|Address|Telephone|Phone|E-?mail)\s*", "", value, flags=re.I)
+                    if value and compact_key(value) != compact_key(label):
+                        return value
+                    next_line = fitz.Rect(
+                        page_rect.x0,
+                        min(page_rect.y1, rect.y1 + 1),
+                        page_rect.x1,
+                        min(page_rect.y1, rect.y1 + 34),
+                    )
+                    value = normalize_key(page.get_text("text", clip=next_line, sort=True))
+                    if value:
+                        return value
+                return ""
+
+            geometry_specs = [
+                ("owner_name", ("Registered Owner(s)", "Registered Owner", "Property Owner", "Owner Name"), owner_start, owner_end),
+                ("owner_address", ("Business Address", "Mailing Address", "Owner Address"), owner_start, owner_end),
+                ("owner_phone", ("Business Telephone", "Telephone", "Phone"), owner_start, owner_end),
+                ("owner_email", ("Owner E-mail", "Owner Email", "Business E-mail", "Email"), owner_start, owner_end),
+                ("applicant_name", ("Applicant Name", "Name of Applicant", "Applicant/Agent"), applicant_start, applicant_end),
+                ("applicant_address", ("Business Address", "Mailing Address", "Applicant Address"), applicant_start, applicant_end),
+                ("applicant_phone", ("Business Telephone", "Telephone", "Phone"), applicant_start, applicant_end),
+                ("applicant_email", ("Business E-mail", "Applicant E-mail", "Applicant Email", "Email"), applicant_start, applicant_end),
+            ]
+            for key, labels, y0, y1 in geometry_specs:
+                value = ""
+                for label in labels:
+                    value = field_value_near_label(label, y0, y1)
+                    if value:
+                        break
+                if value:
+                    text_parts.append(f"{key}: {value}")
+
+            # AcroForm values are often the cleanest source.  Include all page-1
+            # widgets with a hard cap; field names supply party/field context.
             try:
                 widget = page.first_widget
-                seen = 0
-                while widget is not None and seen < 250:
-                    seen += 1
+                seen_widgets = 0
+                while widget is not None and seen_widgets < 300:
+                    seen_widgets += 1
+                    field_name = normalize_key(getattr(widget, "field_name", ""))
+                    field_value = normalize_key(getattr(widget, "field_value", ""))
                     rect = getattr(widget, "rect", None)
                     include = True
                     if rect is not None:
                         try:
-                            include = fitz.Rect(rect).intersects(lower)
+                            include = fitz.Rect(rect).y0 >= lower.y0 - 60
                         except Exception:
                             include = True
-                    if include:
-                        field_name = normalize_key(getattr(widget, "field_name", ""))
-                        field_value = normalize_key(getattr(widget, "field_value", ""))
-                        if field_name or field_value:
-                            text_parts.append(f"{field_name}: {field_value}".strip(" :"))
+                    if include and (field_name or field_value):
+                        text_parts.append(f"{field_name}: {field_value}".strip(" :"))
                     try:
                         widget = widget.next
                     except Exception:
@@ -2841,14 +3240,16 @@ class TorontoOpenDataMonitor:
                     import pytesseract
                     from PIL import Image
 
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=lower)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False, clip=lower)
                     image = Image.open(io.BytesIO(pix.tobytes("png")))
                     timeout = int(self.config.get("ocr_timeout_seconds", 20) or 20)
-                    text_parts.append(pytesseract.image_to_string(image, timeout=timeout))
+                    ocr_text = pytesseract.image_to_string(image, timeout=timeout)
+                    if normalize_key(ocr_text):
+                        text_parts.append("OCR LOWER PAGE 1\n" + ocr_text)
                 except Exception as exc:
                     LOGGER.info("OCR fallback unavailable/timed out for application form PDF: %s", exc)
         except Exception as exc:
-            LOGGER.info("Could not parse application form PDF lower section: %s", exc)
+            LOGGER.info("Could not parse application form PDF page 1: %s", exc)
         finally:
             if doc is not None:
                 try:
@@ -3865,15 +4266,72 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
     return 0
 
 
+def diagnose_toronto_url(config: dict[str, Any], url: str) -> int:
+    """Run one Toronto detail page without reading or modifying SQLite state."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    http = HttpClient(
+        config.get("user_agent", DEFAULT_CONFIG["user_agent"]),
+        int(config.get("request_timeout_seconds", 30)),
+    )
+    monitor = TorontoOpenDataMonitor(http, config.get("toronto", {}))
+    canonical = monitor._application_details_url(url)
+    payload = {
+        "raw_application_url": url,
+        "detail_url": canonical,
+        "address": parse_qs(urlparse(url).query).get("title", [""])[0],
+        "file_number": "",
+    }
+    result = monitor.enrich_application(payload)
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    return 0 if result.get("enrichment_status") == "ok" else 2
+
+
+def forget_toronto_url(config: dict[str, Any], url: str) -> int:
+    """Remove supplied/canonical URL keys so the regular monitor retries them."""
+    http = HttpClient(
+        config.get("user_agent", DEFAULT_CONFIG["user_agent"]),
+        int(config.get("request_timeout_seconds", 30)),
+    )
+    monitor = TorontoOpenDataMonitor(http, config.get("toronto", {}))
+    canonical = monitor._application_details_url(url) or url
+    variants = {url, canonical}
+    parsed = urlparse(canonical)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if query:
+        variants.add(parsed._replace(query=urlencode({k: v[0] for k, v in query.items()})).geturl())
+    keys = {
+        "toronto:" + stable_hash({"application_url": normalized_key_part(value)})[:40]
+        for value in variants if normalize_key(value)
+    }
+    deleted = StateStore(config["state_db"]).delete_seen("toronto_open_data", keys)
+    print(f"Removed {deleted} matching Toronto seen-state row(s).")
+    if not deleted:
+        print("No exact URL key matched. Use --diagnose-url to test without state, or inspect the SQLite seen_items table.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Monitor Toronto/Ottawa development applications and construction/development news.")
     parser.add_argument("--config", default="config.yml", help="Path to YAML config file")
     parser.add_argument("--dry-run", action="store_true", help="Print notifications instead of sending them")
+    parser.add_argument(
+        "--diagnose-url",
+        help="Render and diagnose one Toronto application URL without touching the state database",
+    )
+    parser.add_argument(
+        "--forget-url",
+        help="Remove a Toronto application URL from SQLite seen state so the normal monitor retries it",
+    )
     args = parser.parse_args(argv)
     config_path = args.config if os.path.exists(args.config) else None
     if args.config and not config_path:
         print(f"Config {args.config!r} not found; using defaults.", file=sys.stderr)
-    return run(load_config(config_path), dry_run=args.dry_run)
+    config = load_config(config_path)
+    if args.forget_url:
+        return forget_toronto_url(config, args.forget_url)
+    if args.diagnose_url:
+        return diagnose_toronto_url(config, args.diagnose_url)
+    return run(config, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
