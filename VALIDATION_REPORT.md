@@ -40,3 +40,9 @@ validation. The expected revision marker is:
 ```text
 Toronto enrichment revision: 2026-07-17-supporting-click-latch-v3
 ```
+
+## Workflow synchronization v3.1
+
+- Confirmed `.github/workflows/dev-project-monitor.yml` invokes the monitor through `xvfb-run -a`.
+- Added log marker `Toronto workflow revision: 2026-07-17-xvfb-sync-v3.1`.
+- Full reconciliation suite: 11 passed.

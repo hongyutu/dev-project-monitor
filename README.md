@@ -54,3 +54,7 @@ Toronto results are not notified by default. Diagnostics are written under
 `data/toronto_debug`.
 
 See `RECONCILIATION_NOTES.md` for the detailed merged behaviour.
+
+## Applying reconciled ZIP updates
+
+The `.github` directory is hidden on Linux/macOS and is not matched by shell wildcards such as `*`. When replacing repository contents, explicitly copy `.github/workflows/dev-project-monitor.yml`, or extract the ZIP directly over the repository root. The reconciliation test intentionally fails when the workflow and Python/config files are from different package revisions.
