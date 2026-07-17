@@ -22,6 +22,11 @@ on:
         options:
           - "true"
           - "false"
+      diagnose_url:
+        description: "Optional Toronto Application Details URL to diagnose without state"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -33,6 +38,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Check out repo
@@ -44,13 +50,15 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Restore monitor state
+      - name: Restore monitor state and Toronto browser profile
         uses: actions/cache@v5
         with:
-          path: data
-          key: dev-project-monitor-state-${{ github.run_id }}
+          path: |
+            data/dev_project_monitor.sqlite3
+            data/toronto_browser_profile
+          key: dev-project-monitor-state-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            dev-project-monitor-state-
+            dev-project-monitor-state-${{ runner.os }}-
 
       - name: Reset monitor state for manual initial run
         if: github.event_name == 'workflow_dispatch' && inputs.reset_state == 'true'
@@ -58,15 +66,20 @@ jobs:
           rm -f data/dev_project_monitor.sqlite3
           echo "Monitor state reset for this manual run."
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Install browser and OCR dependencies
+      - name: Run reconciliation tests
+        run: python -m pytest -q
+
+      - name: Install Chromium and OCR dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr
           python -m playwright install --with-deps chromium
-          
+
       - name: Run monitor
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -78,10 +91,23 @@ jobs:
           NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
           NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == 'true' && '1' || '0' }}
+          DIAGNOSE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnose_url || '' }}
         run: |
-          mkdir -p data
-          ARGS=""
+          mkdir -p data/toronto_debug data/toronto_browser_profile
+          ARGS=(--config config.yml)
           if [ "$DRY_RUN" = "1" ]; then
-            ARGS="--dry-run"
+            ARGS+=(--dry-run)
           fi
-          python -m dev_project_monitor.monitor --config config.yml $ARGS
+          if [ -n "$DIAGNOSE_URL" ]; then
+            ARGS+=(--diagnose-url "$DIAGNOSE_URL")
+          fi
+          python -m dev_project_monitor.monitor "${ARGS[@]}"
+
+      - name: Upload Toronto diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: toronto-debug-${{ github.run_id }}
+          path: data/toronto_debug/
+          if-no-files-found: ignore
+          retention-days: 14
