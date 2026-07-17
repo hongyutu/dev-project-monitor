@@ -896,7 +896,7 @@ class TorontoOpenDataMonitor:
                         # analytics/API requests open, and this monitor only needs the rendered
                         # Supporting Documentation table.
                         try:
-                            page.wait_for_load_state("networkidle", timeout=8000)
+                            page.wait_for_load_state("networkidle", timeout=3000)
                         except Exception:
                             pass
 
@@ -917,7 +917,7 @@ class TorontoOpenDataMonitor:
                                 LOGGER.info("Toronto render canonical reload: %s -> %s", normalized_start, normalized_current)
                                 page.goto(normalized_current, wait_until="domcontentloaded", timeout=int(self.config.get("page_timeout_ms", 60000)))
                                 try:
-                                    page.wait_for_load_state("networkidle", timeout=8000)
+                                    page.wait_for_load_state("networkidle", timeout=3000)
                                 except Exception:
                                     pass
                                 page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
@@ -935,6 +935,13 @@ class TorontoOpenDataMonitor:
                             ).wait_for(timeout=30000)
                         except Exception:
                             pass
+
+                        # The AIC app lazily mounts lower-page sections. Scroll first;
+                        # otherwise the Supporting Documentation header/table may not
+                        # exist yet and all clicks become no-ops.
+                        mount_probe = self._scroll_until_supporting_docs_mounted(page)
+                        if not (mount_probe.get("downloadButtons") or mount_probe.get("supportingTextMatches") or mount_probe.get("referenceFileMatches")):
+                            LOGGER.info("Toronto Supporting Documentation not mounted after scroll probe; continuing with bounded fallback")
 
                         self._expand_supporting_documentation(page)
 
@@ -965,6 +972,10 @@ class TorontoOpenDataMonitor:
                         # it does not click downloads; it only inspects first-td +
                         # button.downloadFile[data-id] rows after each search.
                         missing_button_names = [name for name in self.REQUIRED_DOCUMENTS if name not in button_available]
+                        search_probe = self._supporting_docs_probe(page)
+                        if missing_button_names and not (search_probe.get("downloadButtons") or search_probe.get("supportingTextMatches") or search_probe.get("referenceFileMatches")):
+                            LOGGER.info("Toronto document search skipped because document UI is not mounted for %s: %s", final_url, search_probe)
+                            missing_button_names = []
                         if missing_button_names:
                             search_terms = {
                                 "Application Form": ["Application Form"],
@@ -1055,11 +1066,25 @@ class TorontoOpenDataMonitor:
         return response.url, response.text
 
     def _document_scopes(self, page: Any) -> list[Any]:
+        """Return stable Playwright scopes for document inspection.
+
+        The Toronto page creates and destroys helper frames during redirects,
+        analytics, translation widgets, and app bootstrapping. Inspecting those
+        frames caused long hangs and repeated "Frame was detached" errors in
+        GitHub Actions. By default we inspect the main page only; enable
+        `inspect_child_frames: true` in config only for debugging.
+        """
         scopes: list[Any] = [page]
+        if not self.config.get("inspect_child_frames", False):
+            return scopes
         try:
             for frame in page.frames:
-                if frame is not page.main_frame:
-                    scopes.append(frame)
+                try:
+                    if frame is page.main_frame or frame.is_detached():
+                        continue
+                except Exception:
+                    continue
+                scopes.append(frame)
         except Exception:
             pass
         return scopes
@@ -1072,6 +1097,78 @@ class TorontoOpenDataMonitor:
             except Exception:
                 continue
         return "\n".join(parts)
+
+    def _supporting_docs_probe(self, page: Any) -> dict[str, int]:
+        """Cheap probe for whether the document UI has mounted."""
+        try:
+            return page.evaluate(
+                r"""
+                () => {
+                    const clean = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+                    const bodyText = clean(document.body ? document.body.innerText || document.body.textContent || '' : '');
+                    return {
+                        downloadButtons: document.querySelectorAll('button.downloadFile[data-id], .downloadFile[data-id]').length,
+                        supportingTextMatches: /Supporting\s+Documentation/i.test(bodyText) ? 1 : 0,
+                        referenceFileMatches: /Reference\s+File/i.test(bodyText) ? 1 : 0,
+                        documentRows: Array.from(document.querySelectorAll('tr')).filter(tr => /Application Form|Architectural|Civil|Geotechnical|Hydrogeological/i.test(clean(tr.innerText || tr.textContent || ''))).length,
+                    };
+                }
+                """
+            ) or {"downloadButtons": 0, "supportingTextMatches": 0, "referenceFileMatches": 0, "documentRows": 0}
+        except Exception:
+            return {"downloadButtons": 0, "supportingTextMatches": 0, "referenceFileMatches": 0, "documentRows": 0}
+
+    def _scroll_until_supporting_docs_mounted(self, page: Any, max_seconds: float | None = None) -> dict[str, int]:
+        """Scroll through the JS app so lazy sections mount before we click them."""
+        max_seconds = float(max_seconds or self.config.get("supporting_docs_mount_wait_seconds", 12) or 12)
+        deadline = time.monotonic() + max_seconds
+        best = self._supporting_docs_probe(page)
+        last_y = -1
+        stable_rounds = 0
+        step = 0
+        while time.monotonic() < deadline:
+            if best.get("downloadButtons", 0) or best.get("supportingTextMatches", 0) or best.get("referenceFileMatches", 0):
+                break
+            step += 1
+            try:
+                pos = page.evaluate(
+                    """
+                    () => {
+                        const y = window.scrollY || document.documentElement.scrollTop || 0;
+                        const h = Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0);
+                        const vh = window.innerHeight || document.documentElement.clientHeight || 900;
+                        window.scrollBy(0, Math.max(700, Math.floor(vh * 0.85)));
+                        return {y, h, vh, newY: window.scrollY || document.documentElement.scrollTop || 0};
+                    }
+                    """
+                ) or {}
+                new_y = int(pos.get("newY") or 0)
+                if new_y == last_y:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                last_y = new_y
+                if stable_rounds >= 2:
+                    try:
+                        page.keyboard.press("End", timeout=500)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+            best = self._supporting_docs_probe(page)
+            if step in {1, 3, 6, 10}:
+                LOGGER.info("Toronto Supporting Documentation mount probe step %s: %s", step, best)
+        try:
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+        LOGGER.info("Toronto Supporting Documentation mount probe final: %s", best)
+        return best
 
     def _expand_supporting_documentation(self, page: Any) -> None:
         """Open the Supporting Documentation accordion without toggling it closed.
@@ -1327,24 +1424,28 @@ class TorontoOpenDataMonitor:
             pass
 
     def _wait_for_toronto_download_rows(self, page: Any, base_url: str) -> tuple[dict[str, str], set[str]]:
-        """Poll for exact button.downloadFile[data-id] rows before declaring docs missing."""
-        timeout_seconds = float(self.config.get("document_rows_wait_seconds", 25) or 25)
+        """Bounded wait for exact button.downloadFile[data-id] rows.
+
+        The previous version repeatedly forced accordions/tables and inspected
+        detached frames, which could hold a GitHub Actions job for many minutes.
+        This version has a hard small cap and exits early when the document UI
+        has not mounted at all.
+        """
+        timeout_seconds = float(self.config.get("document_rows_wait_seconds", 8) or 8)
         deadline = time.monotonic() + timeout_seconds
         best_links: dict[str, str] = {}
         best_available: set[str] = set()
         attempt = 0
 
-        while True:
+        while time.monotonic() < deadline:
             attempt += 1
-            for scope in self._document_scopes(page):
-                try:
-                    self._set_document_table_to_all_rows(scope)
-                except Exception:
-                    pass
+            try:
+                self._set_document_table_to_all_rows(page)
+            except Exception:
+                pass
 
             links, available = self._extract_download_button_document_rows(page, base_url)
-            for name in available:
-                best_available.add(name)
+            best_available.update(available)
             for name, href in links.items():
                 if href and not best_links.get(name):
                     best_links[name] = href
@@ -1358,62 +1459,19 @@ class TorontoOpenDataMonitor:
                 )
                 return best_links, best_available
 
-            # Wait for the exact DevTools structure the user observed.
-            try:
-                for scope in self._document_scopes(page):
-                    found = scope.evaluate(
-                        r"""
-                        () => {
-                            const roots = [];
-                            const seenRoots = new Set();
-                            const addRoot = root => {
-                                if (!root || seenRoots.has(root)) return;
-                                seenRoots.add(root);
-                                roots.push(root);
-                                let nodes = [];
-                                try { nodes = Array.from(root.querySelectorAll('*')); } catch (e) { nodes = []; }
-                                for (const node of nodes) if (node.shadowRoot) addRoot(node.shadowRoot);
-                            };
-                            addRoot(document);
-                            for (const root of roots) {
-                                let rows = [];
-                                try { rows = Array.from(root.querySelectorAll('tr, [role="row"]')); } catch (e) { rows = []; }
-                                for (const tr of rows) {
-                                    const cells = Array.from(tr.children || []).filter(el => el.tagName && el.tagName.toLowerCase() === 'td');
-                                    if (cells.length >= 4
-                                        && /Application\s+Form/i.test(cells[0].innerText || cells[0].textContent || '')
-                                        && tr.querySelector('button.downloadFile[data-id], .downloadFile[data-id]')) {
-                                        return true;
-                                    }
-                                }
-                            }
-                            return false;
-                        }
-                        """
-                    )
-                    if found:
-                        links, available = self._extract_download_button_document_rows(page, base_url)
-                        for name in available:
-                            best_available.add(name)
-                        for name, href in links.items():
-                            if href and not best_links.get(name):
-                                best_links[name] = href
-                        return best_links, best_available
-            except Exception:
-                pass
-
-            if time.monotonic() >= deadline:
+            probe = self._supporting_docs_probe(page)
+            if not (probe.get("downloadButtons") or probe.get("supportingTextMatches") or probe.get("referenceFileMatches")):
+                # No document UI exists in this browser session; stop burning time.
+                LOGGER.info("Toronto document row wait stopping early for %s; document UI not mounted: %s", base_url, probe)
                 break
 
-            self._click_supporting_docs_with_playwright_locators(page)
-            self._force_supporting_docs_visible(page)
             try:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(1000)
             except Exception:
-                pass
+                break
 
         LOGGER.info(
-            "Toronto exact document rows timed out for %s after %.1fs; best=%s",
+            "Toronto exact document rows not found for %s after %.1fs; best=%s",
             base_url,
             timeout_seconds,
             ", ".join(sorted(best_available)) or "none",
@@ -1982,75 +2040,67 @@ class TorontoOpenDataMonitor:
             pass
 
     def _set_document_table_to_all_rows(self, scope: Any, search_term: str = "") -> None:
-        """Make the Supporting Documentation table expose matching rows in the DOM."""
+        """Make the Supporting Documentation table expose matching rows in the DOM.
+
+        This must be best-effort and fast. Detached frames or absent tables are
+        normal during Toronto page bootstrapping and should not log repeatedly.
+        """
         try:
             self._set_document_table_to_all_rows_with_locators(scope, search_term)
         except Exception:
             pass
-        scope.evaluate(
-            """
-            (searchTerm) => {
-                const terms = (searchTerm || '').trim();
+        try:
+            scope.evaluate(
+                """
+                (searchTerm) => {
+                    const terms = (searchTerm || '').trim();
+                    const fire = (el, type) => {
+                        try { el.dispatchEvent(new Event(type, { bubbles: true })); } catch (e) {}
+                    };
 
-                const fire = (el, type) => el.dispatchEvent(new Event(type, { bubbles: true }));
-
-                if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
-                    window.jQuery('table').each(function () {
-                        try {
-                            const dt = window.jQuery(this).DataTable();
-                            if (dt.search) dt.search(terms);
-                            if (dt.page && dt.page.len) dt.page.len(100).draw(false);
-                        } catch (e) {}
-                    });
-                }
-
-                if (window.DataTable && window.DataTable.tables) {
-                    try {
-                        for (const table of window.DataTable.tables({visible: true})) {
+                    if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+                        window.jQuery('table').each(function () {
                             try {
-                                const dt = new window.DataTable(table);
+                                const dt = window.jQuery(this).DataTable();
                                 if (dt.search) dt.search(terms);
                                 if (dt.page && dt.page.len) dt.page.len(100).draw(false);
                             } catch (e) {}
+                        });
+                    }
+
+                    const searchInputs = Array.from(document.querySelectorAll(
+                        'input[type="search"], input[aria-label*="Search" i], input[placeholder*="Search" i]'
+                    ));
+                    for (const input of searchInputs.slice(0, 5)) {
+                        input.focus();
+                        input.value = terms;
+                        fire(input, 'input');
+                        fire(input, 'keyup');
+                        fire(input, 'change');
+                    }
+
+                    for (const sel of Array.from(document.querySelectorAll('select')).slice(0, 10)) {
+                        const opts = Array.from(sel.options || []);
+                        if (!opts.length) continue;
+                        const chosen =
+                            opts.find(o => o.value === '-1') ||
+                            opts.find(o => o.value === '100') ||
+                            opts.find(o => /100/.test(o.textContent || '')) ||
+                            opts[opts.length - 1];
+                        if (chosen) {
+                            sel.value = chosen.value;
+                            fire(sel, 'input');
+                            fire(sel, 'change');
                         }
-                    } catch (e) {}
-                }
-
-                const searchInputs = Array.from(document.querySelectorAll(
-                    'input[type="search"], input[aria-label*="Search" i], input[placeholder*="Search" i]'
-                ));
-                for (const input of searchInputs) {
-                    input.focus();
-                    input.value = terms;
-                    fire(input, 'input');
-                    fire(input, 'keyup');
-                    fire(input, 'change');
-                }
-
-                for (const sel of document.querySelectorAll('select')) {
-                    const opts = Array.from(sel.options || []);
-                    if (!opts.length) continue;
-                    const numeric = opts
-                        .map(o => ({ option: o, n: parseInt(o.value || o.textContent || '0', 10) }))
-                        .filter(x => !Number.isNaN(x.n));
-                    const chosen =
-                        opts.find(o => o.value === '-1') ||
-                        opts.find(o => o.value === '100') ||
-                        opts.find(o => /100/.test(o.textContent || '')) ||
-                        (numeric.length ? numeric.sort((a, b) => b.n - a.n)[0].option : null) ||
-                        opts[opts.length - 1];
-                    if (chosen) {
-                        sel.value = chosen.value;
-                        fire(sel, 'input');
-                        fire(sel, 'change');
                     }
                 }
-            }
-            """,
-            search_term,
-        )
+                """,
+                search_term,
+            )
+        except Exception:
+            return
         try:
-            scope.wait_for_timeout(1000)
+            scope.wait_for_timeout(350)
         except Exception:
             pass
 
