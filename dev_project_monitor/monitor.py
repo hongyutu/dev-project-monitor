@@ -62,7 +62,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "render_with_playwright": True,
         "require_dynamic_application_widget": True,
         "application_widget_wait_seconds": 30,
-        "document_api_replay_timeout_ms": 7000,
+        "document_api_replay_timeout_ms": 5000,
+        "document_api_replay_max_attempts": 12,
+        "document_api_replay_total_seconds": 25,
+        "report_partial_on_enrichment_failure": True,
         "save_debug_artifacts_on_failure": True,
         "debug_artifacts_dir": "data/toronto_debug",
         "page_timeout_ms": 60000,
@@ -956,100 +959,110 @@ class TorontoOpenDataMonitor:
                     pass
                 page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
 
-                # Some legacy links redirect to the canonical id/pid/title URL.
+                # The folderRsn route can update page.url to the canonical
+                # id/pid/title URL after initializing the application widget.
+                # Do not navigate a second time. The July 17 GitHub Actions run
+                # showed that this reload discarded the initialized widget and
+                # left only the static City "Loading" shell.
                 normalized_start = self._application_details_url(url) or html.unescape(normalize_key(url))
                 normalized_current = self._application_details_url(page.url) or html.unescape(normalize_key(page.url))
-                if (
-                    normalized_current
-                    and normalized_current != normalized_start
-                    and "id=" in normalized_current
-                    and "pid=" in normalized_current
-                ):
-                    LOGGER.info("Toronto render canonical reload: %s -> %s", normalized_start, normalized_current)
-                    page.goto(
+                if normalized_current and normalized_current != normalized_start:
+                    LOGGER.info(
+                        "Toronto render URL changed in-place: %s -> %s; retaining the live page without reload",
+                        normalized_start,
                         normalized_current,
-                        wait_until="domcontentloaded",
-                        timeout=int(self.config.get("page_timeout_ms", 60000)),
                     )
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=3500)
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(int(self.config.get("post_load_wait_ms", 2500)))
 
                 widget_probe = self._wait_for_application_widget(page)
                 diagnostics["widget_probe"] = widget_probe
-                if not widget_probe.get("ready"):
+                widget_ready = bool(widget_probe.get("ready"))
+                mount_probe: dict[str, Any] = {
+                    "downloadButtons": 0,
+                    "supportingTextMatches": 0,
+                    "referenceFileMatches": 0,
+                    "documentRows": 0,
+                }
+
+                if widget_ready:
+                    mount_probe = self._scroll_until_supporting_docs_mounted(page)
+                    diagnostics["supporting_docs_mount_probe"] = mount_probe
+                    self._expand_supporting_documentation(page)
+                    for scope in self._document_scopes(page):
+                        self._set_document_table_to_all_rows(scope)
+
+                    # Trigger lazy content in the main page and application frames.
+                    for scope in self._document_scopes(page):
+                        try:
+                            scope.evaluate("window.scrollTo(0, document.body ? document.body.scrollHeight : 0)")
+                        except Exception:
+                            pass
+                    page.wait_for_timeout(800)
+                else:
                     debug_path = self._save_toronto_debug_artifacts(
                         page, network_recorder, diagnostics, "widget_not_ready"
                     )
-                    raise RuntimeError(
-                        "Toronto application widget did not finish loading. "
-                        f"The static page shell was detected instead of application data. "
-                        f"Debug artifacts: {debug_path or 'not saved'}"
+                    diagnostics["widget_not_ready_debug_path"] = debug_path
+                    LOGGER.warning(
+                        "Toronto application widget did not paint; continuing with recorded XHR/fetch API replay instead of dropping the application. "
+                        "Debug artifacts: %s",
+                        debug_path or "not saved",
                     )
-
-                mount_probe = self._scroll_until_supporting_docs_mounted(page)
-                diagnostics["supporting_docs_mount_probe"] = mount_probe
-                self._expand_supporting_documentation(page)
-                for scope in self._document_scopes(page):
-                    self._set_document_table_to_all_rows(scope)
-
-                # Trigger lazy content in the main page and any application frame.
-                for scope in self._document_scopes(page):
-                    try:
-                        scope.evaluate("window.scrollTo(0, document.body ? document.body.scrollHeight : 0)")
-                    except Exception:
-                        pass
-                page.wait_for_timeout(800)
 
                 final_url = page.url
                 network_links, network_available = self._extract_network_document_data(
                     network_recorder, final_url
                 )
+                # This fallback must run even when the widget/DOM is blank. The
+                # initial folderRsn navigation may already have completed the
+                # application/document API requests before the visual widget failed.
                 replay_links, replay_available, replay_diagnostics = self._replay_document_api_requests(
                     context, network_recorder, final_url
                 )
                 diagnostics["document_api_replay"] = replay_diagnostics
-                for name in replay_available:
-                    network_available.add(name)
+                network_available.update(replay_available)
                 for name, href in replay_links.items():
                     if href and not network_links.get(name):
                         network_links[name] = href
 
-                button_links, button_available = self._wait_for_toronto_download_rows(page, final_url)
+                button_links: dict[str, str] = {}
+                button_available: set[str] = set()
+                visible_available: set[str] = set()
 
-                # Search the DataTable only after the widget and section are proven ready.
-                missing_names = [name for name in self.REQUIRED_DOCUMENTS if name not in button_available]
-                if missing_names:
-                    search_terms = {
-                        "Application Form": ["Application Form", "Application"],
-                        "Architectural Plans": ["Architectural Plans", "Architectural", "Floor Plan", "Elevation"],
-                        "Civil and Utilities Plans": ["Civil and Utilities", "Civil", "Utilities", "Servicing", "Grading", "Stormwater"],
-                        "Geotechnical Study": ["Geotechnical Study", "Geotechnical", "Soil"],
-                        "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater", "Dewatering"],
-                    }
-                    for required_name in missing_names:
-                        for term in search_terms.get(required_name, [required_name]):
-                            for scope in self._document_scopes(page):
-                                self._set_document_table_to_all_rows(scope, term)
-                            self._force_supporting_docs_visible(page)
-                            more_links, more_available = self._extract_download_button_document_rows(page, final_url)
-                            button_available.update(more_available)
-                            for name, href in more_links.items():
-                                if href and not button_links.get(name):
-                                    button_links[name] = href
-                            if required_name in button_available:
-                                break
-                    for scope in self._document_scopes(page):
-                        self._set_document_table_to_all_rows(scope)
+                if widget_ready:
+                    button_links, button_available = self._wait_for_toronto_download_rows(page, final_url)
+
+                    # Search the DataTable only after the widget and section are proven ready.
+                    missing_names = [name for name in self.REQUIRED_DOCUMENTS if name not in button_available]
+                    if missing_names:
+                        search_terms = {
+                            "Application Form": ["Application Form", "Application"],
+                            "Architectural Plans": ["Architectural Plans", "Architectural", "Floor Plan", "Elevation"],
+                            "Civil and Utilities Plans": ["Civil and Utilities", "Civil", "Utilities", "Servicing", "Grading", "Stormwater"],
+                            "Geotechnical Study": ["Geotechnical Study", "Geotechnical", "Soil"],
+                            "Hydrogeological Report": ["Hydrogeological Report", "Hydrogeological", "Hydrogeology", "Groundwater", "Dewatering"],
+                        }
+                        for required_name in missing_names:
+                            for term in search_terms.get(required_name, [required_name]):
+                                for scope in self._document_scopes(page):
+                                    self._set_document_table_to_all_rows(scope, term)
+                                self._force_supporting_docs_visible(page)
+                                more_links, more_available = self._extract_download_button_document_rows(page, final_url)
+                                button_available.update(more_available)
+                                for name, href in more_links.items():
+                                    if href and not button_links.get(name):
+                                        button_links[name] = href
+                                if required_name in button_available:
+                                    break
+                        for scope in self._document_scopes(page):
+                            self._set_document_table_to_all_rows(scope)
+
+                    visible_available = self._document_names_visible_on_page(page)
 
                 document_links = dict(network_links)
                 for name, href in button_links.items():
                     if href and not document_links.get(name):
                         document_links[name] = href
 
-                visible_available = self._document_names_visible_on_page(page)
                 available_names = (
                     set(network_available)
                     | set(button_available)
@@ -1062,7 +1075,8 @@ class TorontoOpenDataMonitor:
 
                 application_form_text = ""
                 if self.config.get("extract_application_form_contacts", True) and "Application Form" in available_names:
-                    application_form_text = self._extract_application_form_text_from_page(page, final_url)
+                    if widget_ready:
+                        application_form_text = self._extract_application_form_text_from_page(page, final_url)
                     if not normalize_key(application_form_text):
                         direct_form_url = document_links.get("Application Form")
                         if direct_form_url:
@@ -1092,22 +1106,40 @@ class TorontoOpenDataMonitor:
                     }
                 )
 
-                # A loaded application may legitimately have no published documents,
-                # but only when the Supporting Documentation section itself was found.
-                if not available_names and not (
+                # Preserve useful metadata/documents even when the visual widget
+                # or Application Form contact extraction is incomplete. The run
+                # controller reports this once as a partial result and leaves the
+                # original application key queued for a later retry.
+                partial_reasons: list[str] = []
+                if not widget_ready:
+                    partial_reasons.append("widget-not-ready")
+
+                supporting_section_found = bool(
                     final_probe.get("supportingTextMatches")
                     or final_probe.get("referenceFileMatches")
                     or mount_probe.get("supportingTextMatches")
                     or mount_probe.get("referenceFileMatches")
-                ):
+                )
+                if not available_names and not supporting_section_found:
+                    partial_reasons.append("supporting-section-not-detected")
                     debug_path = self._save_toronto_debug_artifacts(
                         page, network_recorder, diagnostics, "supporting_section_missing"
                     )
-                    raise RuntimeError(
-                        "Application data loaded, but the Supporting Documentation section "
-                        "was never detected. This is a render/API failure, not proof that no "
-                        f"documents exist. Debug artifacts: {debug_path or 'not saved'}"
+                    diagnostics["supporting_section_missing_debug_path"] = debug_path
+
+                if (
+                    self.config.get("extract_application_form_contacts", True)
+                    and "Application Form" in available_names
+                    and not normalize_key(application_form_text)
+                ):
+                    partial_reasons.append("application-form-contacts-not-extracted")
+
+                for reason in dict.fromkeys(partial_reasons):
+                    html_text += (
+                        '\n<div id="toronto-enrichment-status" '
+                        f'data-status="{html.escape(reason, quote=True)}"></div>\n'
                     )
+                diagnostics["partial_reasons"] = list(dict.fromkeys(partial_reasons))
 
                 LOGGER.info(
                     "Supporting Documentation for %s: direct_links=%s; available_rows=%s; "
@@ -1266,6 +1298,57 @@ class TorontoOpenDataMonitor:
         slug = re.sub(r"[^A-Za-z0-9._-]+", "_", normalize_key(value)).strip("_")
         return slug[:80] or "toronto_application"
 
+    def _network_debug_snapshot(self, recorder: dict[str, Any]) -> dict[str, Any]:
+        """Return useful network diagnostics without persisting session secrets."""
+        snapshot: dict[str, Any] = {"requests": [], "responses": [], "download_urls": []}
+        if not isinstance(recorder, dict):
+            return snapshot
+
+        for item in (recorder.get("requests") or [])[:500]:
+            if not isinstance(item, dict):
+                continue
+            headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
+            debug_headers: dict[str, str] = {}
+            for key, value in headers.items():
+                lowered = str(key).lower()
+                if lowered in {"authorization", "x-xsrf-token", "x-csrf-token", "cookie"}:
+                    debug_headers[lowered] = "[REDACTED]"
+                elif lowered in {"accept", "content-type", "origin", "referer", "x-requested-with"}:
+                    debug_headers[lowered] = str(value)
+            post_data = item.get("post_data")
+            snapshot["requests"].append({
+                "url": item.get("url"),
+                "method": item.get("method"),
+                "resource_type": item.get("resource_type"),
+                "content_type": item.get("content_type"),
+                "post_data_chars": len(str(post_data)) if post_data not in (None, "") else 0,
+                "headers": debug_headers,
+            })
+
+        allowed_response_headers = {
+            "content-type", "content-disposition", "content-length",
+            "location", "cache-control", "etag", "last-modified",
+        }
+        for item in (recorder.get("responses") or [])[:500]:
+            if not isinstance(item, dict):
+                continue
+            headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
+            snapshot["responses"].append({
+                "url": item.get("url"),
+                "status": item.get("status"),
+                "resource_type": item.get("resource_type"),
+                "headers": {
+                    str(k).lower(): str(v)
+                    for k, v in headers.items()
+                    if str(k).lower() in allowed_response_headers
+                },
+            })
+
+        snapshot["download_urls"] = [
+            normalize_key(value) for value in (recorder.get("download_urls") or [])[:200] if normalize_key(value)
+        ]
+        return snapshot
+
     def _save_toronto_debug_artifacts(
         self,
         page: Any,
@@ -1284,7 +1367,7 @@ class TorontoOpenDataMonitor:
         payload = dict(diagnostics or {})
         payload["reason"] = reason
         payload["page_url"] = normalize_key(getattr(page, "url", ""))
-        payload["network"] = recorder
+        payload["network"] = self._network_debug_snapshot(recorder)
         try:
             payload["final_widget_probe"] = self._application_widget_probe(page)
             payload["final_supporting_docs_probe"] = self._supporting_docs_probe(page)
@@ -1317,53 +1400,73 @@ class TorontoOpenDataMonitor:
         recorder: dict[str, Any],
         base_url: str,
     ) -> tuple[dict[str, str], set[str], dict[str, Any]]:
-        """Replay bounded XHR/fetch requests through the browser session.
+        """Replay a bounded, prioritized set of completed XHR/fetch requests.
 
-        Reading retained Playwright ``Response`` bodies can hang. Replaying the
-        already-completed request through ``context.request`` shares browser
-        cookies, has an explicit timeout, and exposes JSON document metadata even
-        when the DataTable is virtualized or hidden in an iframe.
+        The replay shares browser cookies and preserves safe request headers. It
+        is intentionally capped by both request count and total wall-clock time
+        so a broken City endpoint cannot stall an entire monitor run.
         """
         links: dict[str, str] = {}
         available: set[str] = set()
         attempts: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
-        timeout_ms = int(self.config.get("document_api_replay_timeout_ms", 7000) or 7000)
+        per_request_timeout_ms = int(self.config.get("document_api_replay_timeout_ms", 5000) or 5000)
+        max_attempts = int(self.config.get("document_api_replay_max_attempts", 12) or 12)
+        total_seconds = float(self.config.get("document_api_replay_total_seconds", 25) or 25)
+        deadline = time.monotonic() + max(2.0, total_seconds)
         requests_meta = recorder.get("requests", []) if isinstance(recorder, dict) else []
+        deny_tokens = (
+            "google-analytics", "googletagmanager", "doubleclick", "medallia",
+            "qualtrics", "hotjar", "facebook", "twitter", "youtube",
+            "translate.google", "recaptcha",
+        )
+        priority_tokens = (
+            "document", "attachment", "download", "file", "support",
+            "application", "aic", "folder", "submission", "planning",
+        )
 
-        for item in requests_meta[:120]:
-            if len(attempts) >= 30 or not isinstance(item, dict):
+        candidates: list[tuple[int, int, dict[str, Any]]] = []
+        for index, item in enumerate(requests_meta[:300]):
+            if not isinstance(item, dict):
+                continue
+            url = normalize_key(item.get("url"))
+            resource_type = normalize_key(item.get("resource_type")).lower()
+            if not url or resource_type not in {"xhr", "fetch"} or self._is_static_asset_url(url):
+                continue
+            lowered = url.lower()
+            if any(token in lowered for token in deny_tokens):
+                continue
+            method = normalize_key(item.get("method") or "GET").upper()
+            score = sum(5 for token in priority_tokens if token in lowered)
+            score += 3 if method not in {"GET", "HEAD"} else 0
+            score += 2 if "json" in normalize_key(item.get("content_type")).lower() else 0
+            candidates.append((score, -index, item))
+
+        for _score, _neg_index, item in sorted(candidates, reverse=True):
+            if len(attempts) >= max_attempts or time.monotonic() >= deadline:
                 break
             url = normalize_key(item.get("url"))
             method = normalize_key(item.get("method") or "GET").upper()
             post_data = item.get("post_data")
-            resource_type = normalize_key(item.get("resource_type")).lower()
-            if not url or self._is_static_asset_url(url):
-                continue
-            lowered = url.lower()
-            relevant = resource_type in {"xhr", "fetch"} and (
-                method != "GET"
-                or any(token in lowered for token in (
-                    "application", "aic", "document", "attachment", "file",
-                    "folder", "submission", "support", "planning",
-                ))
-            )
-            if not relevant:
-                continue
             key = (method, url, normalize_key(post_data))
             if key in seen:
                 continue
             seen.add(key)
 
+            captured_headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
             request_headers: dict[str, str] = {
-                "accept": "application/json,text/plain,text/html,*/*",
-                "referer": base_url,
+                str(k).lower(): str(v) for k, v in captured_headers.items() if normalize_key(v)
             }
+            request_headers.setdefault("accept", "application/json,text/plain,text/html,*/*")
+            request_headers.setdefault("referer", base_url)
             content_type = normalize_key(item.get("content_type"))
             if content_type:
-                request_headers["content-type"] = content_type
+                request_headers.setdefault("content-type", content_type)
+
             record: dict[str, Any] = {"method": method, "url": url}
             try:
+                remaining_ms = int(max(1000, (deadline - time.monotonic()) * 1000))
+                timeout_ms = min(per_request_timeout_ms, remaining_ms)
                 kwargs: dict[str, Any] = {
                     "method": method,
                     "headers": request_headers,
@@ -1400,11 +1503,13 @@ class TorontoOpenDataMonitor:
             attempts.append(record)
 
         if available:
-            LOGGER.info(
-                "Toronto document API replay found: %s",
-                ", ".join(sorted(available)),
-            )
-        return links, available, {"attempts": attempts, "found": sorted(available)}
+            LOGGER.info("Toronto document API replay found: %s", ", ".join(sorted(available)))
+        return links, available, {
+            "attempts": attempts,
+            "found": sorted(available),
+            "candidate_count": len(candidates),
+            "time_limit_seconds": total_seconds,
+        }
 
     def _document_scopes(self, page: Any) -> list[Any]:
         """Return the main page plus a bounded set of non-analytics child frames.
@@ -1895,13 +2000,20 @@ class TorontoOpenDataMonitor:
                 url = normalize_key(request.url)
                 if self._is_static_asset_url(url):
                     return
-                headers = request.headers or {}
+                headers = {str(k).lower(): str(v) for k, v in (request.headers or {}).items()}
+                safe_header_names = {
+                    "accept", "content-type", "origin", "referer",
+                    "x-requested-with", "x-xsrf-token", "x-csrf-token",
+                    "authorization",
+                }
+                replay_headers = {k: v for k, v in headers.items() if k in safe_header_names and v}
                 item = {
                     "url": url,
                     "method": normalize_key(request.method),
                     "resource_type": normalize_key(request.resource_type),
                     "post_data": request.post_data,
                     "content_type": normalize_key(headers.get("content-type", "")),
+                    "headers": replay_headers,
                 }
                 rows = recorder.setdefault("requests", [])
                 if len(rows) < 500:
@@ -3457,7 +3569,21 @@ class TorontoOpenDataMonitor:
                     LOGGER.info("Toronto contact extraction succeeded from direct Application Form URL for %s", item["detail_url"])
                 else:
                     LOGGER.info("Toronto contact extraction found no owner/applicant data for %s", item["detail_url"])
-            item["enrichment_status"] = "ok"
+            status_codes = list(dict.fromkeys(re.findall(
+                r'<div id="toronto-enrichment-status" data-status="([^"]+)"',
+                html_text or "",
+                flags=re.I,
+            )))
+            if status_codes:
+                messages = {
+                    "widget-not-ready": "City application widget did not paint; document API fallback was used.",
+                    "supporting-section-not-detected": "Supporting Documentation could not be confirmed.",
+                    "application-form-contacts-not-extracted": "Application Form was detected, but owner/applicant fields were not extracted.",
+                }
+                item["enrichment_status"] = "partial"
+                item["enrichment_error"] = " ".join(messages.get(code, code) for code in status_codes)
+            else:
+                item["enrichment_status"] = "ok"
         except Exception as exc:
             item["enrichment_status"] = "failed"
             item["enrichment_error"] = shorten(str(exc), 500)
@@ -3891,6 +4017,8 @@ class Notifier:
             f"Community meeting: {meeting}",
             f"Contact: {contact}",
             f"Link status: {p.get('link_status') or 'Not found'}",
+            f"Enrichment: {p.get('enrichment_status') or 'Not attempted'}"
+            + (f" | {p.get('enrichment_error')}" if p.get('enrichment_error') else ""),
             f"Description: {p.get('description') or 'Not found'}",
             f"Land Owner: {self._format_party(p.get('land_owner'))}",
             f"Applicant: {self._format_party(p.get('applicant'))}",
@@ -3901,6 +4029,8 @@ class Notifier:
     def _render_toronto_simplified(self, p: dict[str, Any]) -> list[str]:
         lines = [
             f"Addresses: {self._format_addresses_with_map(p)}",
+            f"Enrichment: {p.get('enrichment_status') or 'Not attempted'}"
+            + (f" | {p.get('enrichment_error')}" if p.get('enrichment_error') else ""),
             f"Description: {p.get('description') or 'Not found'}",
             f"Land Owner: {self._format_party(p.get('land_owner'))}",
             f"Applicant: {self._format_party(p.get('applicant'))}",
@@ -4197,12 +4327,39 @@ def run(config: dict[str, Any], dry_run: bool = False) -> int:
                 progress_label = item.title or item.payload.get("file_number") or item.payload.get("address") or "Toronto application"
                 LOGGER.info("Toronto enrichment progress %d/%d: %s", index, len(toronto_unseen), progress_label)
                 enriched_payload = toronto_monitor.enrich_application(item.payload)
-                if enriched_payload.get("enrichment_status") == "failed":
-                    LOGGER.warning(
-                        "Toronto enrichment failed and will be retried on the next run: %s; %s",
-                        progress_label,
-                        enriched_payload.get("enrichment_error") or "unknown error",
-                    )
+                if enriched_payload.get("enrichment_status") in {"failed", "partial"}:
+                    partial_payload = dict(enriched_payload)
+                    partial_payload["enrichment_status"] = "partial"
+                    partial_key = item.item_key + ":partial"
+                    already_reported = store.has_seen(item.source, partial_key)
+                    report_partial = bool(config.get("toronto", {}).get("report_partial_on_enrichment_failure", True))
+                    if report_partial and (dry_run or not already_reported):
+                        partial_item = dataclasses.replace(
+                            item,
+                            item_key=partial_key,
+                            url=partial_payload.get("detail_url") or partial_payload.get("raw_application_url") or item.url,
+                            payload=partial_payload,
+                        )
+                        ready_items.append(partial_item)
+                        if not dry_run:
+                            store.mark_seen(partial_item.source, partial_item.item_key, stable_hash(partial_payload))
+                        LOGGER.warning(
+                            "Toronto enrichment incomplete; queued a one-time partial notification and retained the original application for retry: %s; %s",
+                            progress_label,
+                            partial_payload.get("enrichment_error") or "unknown error",
+                        )
+                    elif report_partial:
+                        LOGGER.warning(
+                            "Toronto enrichment remains incomplete; partial notification was already sent and the original application remains queued: %s; %s",
+                            progress_label,
+                            partial_payload.get("enrichment_error") or "unknown error",
+                        )
+                    else:
+                        LOGGER.warning(
+                            "Toronto enrichment incomplete and retained for retry; partial notifications are disabled: %s; %s",
+                            progress_label,
+                            partial_payload.get("enrichment_error") or "unknown error",
+                        )
                     continue
                 ready_item = dataclasses.replace(
                     item,
